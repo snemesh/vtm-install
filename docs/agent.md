@@ -26,9 +26,12 @@ Look at the repository you are in and decide which target the user means:
 
 | Evidence in the repo | Target | Where to run the installer |
 |---|---|---|
-| `docker-compose.yml` / `compose.yaml`, deploy scripts that `ssh` to a host and run `docker compose` | Docker host | on that host (over SSH), or on this machine if the project runs here |
+| `compose.yml`, `compose.yaml`, `docker-compose.yml`, deploy scripts that `ssh` to a host and run `docker compose` | Docker host | on that host (over SSH), or on this machine if the project runs here |
 | Helm charts, k8s manifests, kustomize, `kubectl` in CI | Kubernetes | on any machine where `kubectl` reaches that cluster |
 | Both | ask the user which one to map | |
+
+Pass the target you chose to the installer explicitly (`--docker` or `--kubernetes`) in every step
+below, even when the machine seems to offer only one: then the installer never has to guess.
 
 Where the project actually runs matters, not where the code is. If the project runs on a remote server
 and you have no SSH access to it, tell the user the exact command from step 3 to run there, and stop.
@@ -38,11 +41,13 @@ and you have no SSH access to it, tell the user the exact command from step 3 to
 Run on the target (Docker host over SSH, or locally with `kubectl` pointed at the cluster):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- --check
+curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- --check --docker
+# or: … | sh -s -- --check --kubernetes
 ```
 
-Add `--docker` or `--kubernetes` if both are present. Read the output:
+The installer prints in Russian. Read the output:
 
+- "Проверка сервера: всё нужное есть" (everything needed is there) → install.
 - "установка невозможна" (installation impossible) with reasons → fix what it names if it is yours to
   fix (e.g. start Docker, add the user to the `docker` group, free port 8090 with `--port`), otherwise
   report it to the user and stop.
@@ -51,15 +56,16 @@ Add `--docker` or `--kubernetes` if both are present. Read the output:
 
 ## 3. Install
 
-**Docker host** (needs root or the docker group; on a server use `sudo`):
+**Docker host** (needs root or the docker group; drop `sudo` if you already are root):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sudo sh -s -- --docker --yes --bind 127.0.0.1
 ```
 
-`--bind 127.0.0.1` keeps the map off the internet; the user opens it through an SSH tunnel (step 5).
-Drop it only for a local machine or a private network the user names, or if the user asks for a public
-port — then also suggest putting the map behind their existing reverse proxy with HTTPS.
+`--bind 127.0.0.1` keeps the map off the internet: on the same machine it opens at
+http://127.0.0.1:8090/, from elsewhere through an SSH tunnel (step 5). Keep it by default, also on a
+laptop. Leave it out only when the user asks for the map on the network (a LAN address, or a public port —
+then also suggest their existing reverse proxy with HTTPS in front of it).
 
 **Kubernetes** (needs cluster-admin rights; helm is downloaded if missing):
 
@@ -77,21 +83,37 @@ The installer prints the map's address and password at the end. Keep both for st
 
 Wait 2–3 minutes, then check on the target:
 
-- Docker: `sudo /opt/vtm/vtm.sh status` — every service `running`/`healthy`.
+- Docker: `sudo /opt/vtm/vtm.sh status` — every service `running`/`healthy`. Beyla starts last (it waits
+  for `beyla-config`), so its uptime is shorter: that is not a restart.
 - Kubernetes: `kubectl -n vtm get pods` — all `Running`.
 
-Then confirm the map has data (Docker example; for Kubernetes port-forward first, see step 5):
+Then confirm the map has data. Docker (on the host):
 
 ```sh
 PASS=$(sudo /opt/vtm/vtm.sh password)
 curl -s -c /tmp/vtm.ck -o /dev/null -d "password=$PASS" http://127.0.0.1:8090/login
-curl -s -b /tmp/vtm.ck http://127.0.0.1:8090/api/map.json | head -c 2000
+curl -s -b /tmp/vtm.ck http://127.0.0.1:8090/api/map.json > /tmp/vtm-map.json
 ```
 
-The JSON should list the project's apps under `apps` and, once they talk, `traffic` links. Compare the
-apps with the project's own services (Compose services or Deployments): each should be there. Read
-`coverage.notes` — that is what the map says it cannot see; pass it on to the user. In the first ~5
-minutes a link may point the wrong way; that settles by itself.
+Kubernetes: run `kubectl -n vtm port-forward svc/vtm-map 8090:80 &` first, take the password from step 6,
+then the same two `curl` lines. Summarise the map (python3; or the same with `jq`):
+
+```sh
+python3 - <<'PY'
+import json; m = json.load(open('/tmp/vtm-map.json'))
+print('platform:', m.get('platform'), '| unreadable parts:', m.get('errors') or 'none')
+for a in m['apps']: print('app  ', a['namespace'] + '/' + a['name'], a['role'], 'healthy' if a['healthy'] else 'BROKEN ' + a.get('problem', ''))
+for l in m['links']:
+    if l['kind'] == 'traffic': print('link ', l['from'], '->', l['to'])
+for n in (m.get('coverage') or {}).get('notes', []): print('cannot see:', n)
+PY
+```
+
+Compare the apps with the project's own services (Compose services or Deployments): each should be
+there; VTM's own stack is hidden. Traffic links appear as the apps talk (a minute or two); in the first
+~5 minutes one may point the wrong way, that settles by itself. The `cannot see` lines are what the map
+itself says it misses: pass them on to the user. `servers[].ping_ok` is false unless a ping address was
+configured; that is normal.
 
 ## 5. How the user opens the map
 
@@ -123,6 +145,8 @@ Optionally offer to give the map readable names: on a Docker host, `/opt/vtm/map
 | Kubernetes PVCs `Pending` | no default StorageClass: the installer normally detects this; rerun with `--set storage.ephemeral=true` via helm, or set `storage.className` |
 | `kubectl auth can-i` failures | the user's kube context lacks cluster-admin; ask for one that has it |
 | map shows the stack but not the project | the project runs elsewhere (another host/cluster/context) — install there |
+| «есть и Docker, и Kubernetes: укажите --docker или --kubernetes» | pass the target you chose in step 1 |
+| `sudo: not found` | you are root already: run the same command without `sudo` |
 
 ## 8. Remove
 

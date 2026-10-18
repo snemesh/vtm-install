@@ -60,7 +60,12 @@ ask() {
 
 # ---------- what is here ----------
 docker_here() { has docker && docker info >/dev/null 2>&1; }
-kube_here() { has kubectl && kubectl get --raw /readyz --request-timeout=5s >/dev/null 2>&1; }
+# A cluster: a kube context is set and its API server answers with its version. Without a kubeconfig
+# kubectl falls back to localhost:8080, and any web server there (a project's nginx) answers /readyz.
+kube_here() {
+  has kubectl && kubectl config current-context >/dev/null 2>&1 \
+    && kubectl version -o json --request-timeout=5s 2>/dev/null | grep -q '"serverVersion"'
+}
 
 pick_platform() {
   [ -n "$platform" ] && return
