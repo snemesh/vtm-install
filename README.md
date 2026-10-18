@@ -6,6 +6,10 @@
 curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh
 ```
 
+Сайт с описанием: https://snemesh.github.io/vtm-install/
+
+**Через ИИ-агента:** скажите Claude Code в своём проекте — «Поставь VTM на этот проект по инструкции https://snemesh.github.io/vtm-install/agent.md». Инструкция для агента — [AGENTS.md](AGENTS.md).
+
 Установщик определяет, что на машине — Docker или доступ к кластеру (`kubectl`), проверяет сервер, ставит готовые образы `ghcr.io/snemesh/vtm-collector` и `vtm-map` (amd64, arm64) и печатает адрес карты и пароль.
 
 | Параметр | Что делает |

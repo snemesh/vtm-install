@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VTM — живая карта инфраструктуры</title>
+<meta name="description" content="Одна команда на Docker-хост или в Kubernetes — и через пару минут 3D-карта ваших серверов, приложений и запросов между ними. Ничего не нужно описывать вручную.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #070a14; --surface: #0e1322; --raised: #141b2e; --line: #ffffff14; --line-strong: #ffffff26;
+    --ink: #e8ecf8; --muted: #a3abc4; --faint: #78809a;
+    --accent: #41e0d0; --accent-ink: #04201d; --violet: #a78bfa; --warn: #f2c96d; --bad: #ff6b8b;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.6 Onest, system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  a { color: var(--accent); text-underline-offset: 3px; }
+  code, pre, kbd { font-family: "JetBrains Mono", ui-monospace, monospace; }
+  :not(pre) > code { font-size: .88em; background: var(--raised); border: 1px solid var(--line); padding: 1px 6px; border-radius: 6px; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 20px; }
+  header.top { display: flex; align-items: center; justify-content: space-between; padding: 18px 0; }
+  .logo { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: .02em; color: var(--ink); text-decoration: none; }
+  .logo i { width: 22px; height: 22px; border-radius: 6px; background: conic-gradient(from 200deg, var(--accent), var(--violet), var(--accent)); display: inline-block; }
+  nav a { color: var(--muted); text-decoration: none; margin-left: 20px; font-size: 14px; }
+  nav a:hover { color: var(--ink); }
+
+  .hero { padding: 56px 0 24px; }
+  .hero h1 { font-size: clamp(32px, 5vw, 52px); line-height: 1.1; margin: 0 0 18px; letter-spacing: -.02em; max-width: 16ch; }
+  .hero p.lead { font-size: clamp(17px, 2vw, 20px); color: var(--muted); max-width: 60ch; margin: 0 0 30px; }
+
+  .cmd { position: relative; display: flex; align-items: center; gap: 12px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius); padding: 16px 16px 16px 20px; max-width: 760px; }
+  .cmd pre { margin: 0; flex: 1; min-width: 0; overflow-x: auto; font-size: 15px; color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .cmd pre .p { color: var(--faint); user-select: none; }
+  .copy { flex: none; border: 1px solid var(--line-strong); background: var(--raised); color: var(--ink); font: 500 14px Onest, sans-serif; padding: 8px 14px; border-radius: 10px; cursor: pointer; }
+  .copy:hover { border-color: var(--accent); }
+  .copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .copy[data-done] { color: var(--accent); }
+  .hint { color: var(--faint); font-size: 14px; margin: 12px 0 0; }
+
+  figure.shot { margin: 44px 0 0; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line-strong); background: #000; }
+  figure.shot img { display: block; width: 100%; height: auto; }
+  figure.shot figcaption { padding: 10px 16px; font-size: 13px; color: var(--faint); background: var(--surface); border-top: 1px solid var(--line); }
+
+  section { padding: 56px 0 8px; }
+  h2 { font-size: 26px; margin: 0 0 18px; letter-spacing: -.01em; }
+  h3 { font-size: 17px; margin: 0 0 6px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+  .card p { margin: 0; color: var(--muted); font-size: 15px; }
+  .num { display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 8px; background: var(--raised); border: 1px solid var(--line-strong); color: var(--accent); font-weight: 600; font-size: 14px; margin-bottom: 12px; }
+
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 760px) { .two { grid-template-columns: 1fr; } nav { display: none; } }
+  .card pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; overflow-x: auto; font-size: 13.5px; margin: 12px 0 0; }
+  .card ul { margin: 10px 0 0; padding-left: 18px; color: var(--muted); font-size: 15px; }
+  .card li + li { margin-top: 4px; }
+
+  .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--faint); font-weight: 500; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; background: var(--surface); }
+  tr:last-child td { border-bottom: 0; }
+  td code { white-space: nowrap; }
+
+  .honest { display: grid; grid-template-columns: 1.1fr 1fr; gap: 24px; align-items: center; }
+  @media (max-width: 860px) { .honest { grid-template-columns: 1fr; } }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 13px; font-weight: 500; }
+  .pill.ok { color: #7cf3b8; background: #7cf3b81f; } .pill.wait { color: var(--warn); background: #f2c96d1f; }
+
+  details { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 0 20px; }
+  details + details { margin-top: 10px; }
+  summary { cursor: pointer; padding: 16px 0; font-weight: 500; list-style: none; }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: "+"; color: var(--accent); display: inline-block; width: 22px; font-weight: 600; }
+  details[open] summary::before { content: "–"; }
+  details > div { padding: 0 0 18px 22px; color: var(--muted); font-size: 15px; }
+  details pre { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; overflow-x: auto; font-size: 13.5px; color: var(--ink); }
+
+  .grid > *, .two > *, .honest > * { min-width: 0; }
+  @media (max-width: 520px) { .cmd { flex-direction: column; align-items: stretch; padding: 14px; } .cmd pre { font-size: 13.5px; } th, td { padding: 10px 12px; } }
+  footer code { overflow-wrap: anywhere; }
+  footer { padding: 56px 0 40px; color: var(--faint); font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="logo" href="#"><i aria-hidden="true"></i>VTM</a>
+    <nav aria-label="Разделы">
+      <a href="#how">Как это работает</a>
+      <a href="#install">Установка</a>
+      <a href="#agent">Для ИИ-агента</a>
+      <a href="#options">Параметры</a>
+      <a href="#faq">Вопросы</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="hero">
+      <h1>Карта вашей инфраструктуры за&nbsp;две минуты</h1>
+      <p class="lead">Одна команда на Docker-хост или в Kubernetes-кластер — и VTM сам находит серверы, приложения, базы и сайты, видит запросы между ними и рисует живую 3D-карту. Ничего не нужно описывать вручную.</p>
+
+      <div class="cmd">
+        <pre id="cmd"><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh</pre>
+        <button class="copy" type="button" data-copy="curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh">Скопировать</button>
+      </div>
+      <p class="hint">Запускайте на сервере с Docker или на машине, где <code>kubectl</code> смотрит в ваш кластер. В конце установщик напечатает адрес карты и пароль.</p>
+
+      <figure class="shot">
+        <img src="assets/map.jpg" width="1440" height="900" alt="3D-карта: сервер, на нём приложения проекта и линии трафика между ними" loading="eager">
+        <figcaption>Карта небольшого проекта в Kubernetes: веб, API, Redis, PostgreSQL и генератор нагрузки — найдены сами.</figcaption>
+      </figure>
+    </div>
+
+    <section id="how">
+      <h2>Как это работает</h2>
+      <div class="grid">
+        <div class="card"><span class="num">1</span><h3>Находит, что работает</h3><p>Читает Docker (контейнеры, проекты Compose, порты, настройки) или Kubernetes API (поды, сервисы, ingress). Только чтение — в ваших приложениях ничего не меняется.</p></div>
+        <div class="card"><span class="num">2</span><h3>Видит, кто с кем говорит</h3><p>Grafana Beyla (eBPF) измеряет трафик и запросы между приложениями прямо в ядре — без агентов в коде, без правки образов.</p></div>
+        <div class="card"><span class="num">3</span><h3>Рисует и честно говорит</h3><p>Карта с трафиком, ошибками, логами и цепочками запросов. Если что-то не видно (старое ядро, нет прав), карта так и пишет — вместо «всё работает».</p></div>
+      </div>
+    </section>
+
+    <section id="install">
+      <h2>Установка</h2>
+      <div class="two">
+        <div class="card">
+          <h3>Docker-хост</h3>
+          <p>Проект на Docker Compose или просто контейнеры на одном сервере.</p>
+          <pre>curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sudo sh</pre>
+          <ul>
+            <li>Ставится в <code>/opt/vtm</code>, карта — на <code>http://&lt;IP&nbsp;сервера&gt;:8090/</code></li>
+            <li>Нужно: Docker с <code>docker compose</code>, Linux amd64 или arm64</li>
+            <li>~300&nbsp;МБ памяти, 1–2&nbsp;ГБ диска под метрики, логи и трассы</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Kubernetes</h3>
+          <p>Любой кластер: k3s, kubeadm, kind, облачный. Нужны права администратора кластера.</p>
+          <pre>curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- --kubernetes</pre>
+          <ul>
+            <li>Helm-чарт в namespace <code>vtm</code>; helm установщик скачает сам</li>
+            <li>Карта на NodePort <code>30890</code> каждого сервера, или LoadBalancer, или Ingress</li>
+            <li>Чарт отдельно: <code>oci://ghcr.io/snemesh/charts/vtm</code></li>
+          </ul>
+        </div>
+      </div>
+      <p class="hint">Есть и Docker, и кластер? Установщик спросит, что показывать. Повторный запуск обновляет установку; пароль сохраняется.</p>
+    </section>
+
+    <section class="honest-sec">
+      <div class="honest">
+        <div>
+          <h2>Карта не притворяется</h2>
+          <p style="color:var(--muted)">Чтобы видеть запросы и их ошибки, Beyla нужны возможности ядра: Linux 5.8+, BTF и kprobes. Установщик проверяет это до установки. Если чего-то нет — трафик между приложениями всё равно измеряется, но карта вместо <span class="pill ok">Всё работает</span> пишет <span class="pill wait">Неисправностей не видно</span> и объясняет, что именно ей не видно и почему.</p>
+          <p style="color:var(--muted)">Проверить сервер, ничего не ставя:</p>
+          <div class="cmd" style="max-width:none">
+            <pre><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- --check</pre>
+            <button class="copy" type="button" data-copy="curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- --check">Скопировать</button>
+          </div>
+        </div>
+        <figure class="shot" style="margin:0">
+          <img src="assets/map-blind.jpg" width="1440" height="900" alt="Строка состояния карты: «Неисправностей не видно», «Запросы не видны» и список причин" loading="lazy">
+          <figcaption>Сервер без kprobes: карта прямо говорит, что запросы не видны.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="agent">
+      <h2>Поставить руками ИИ-агента</h2>
+      <p style="color:var(--muted);max-width:66ch;margin:0 0 18px">Откройте Claude Code (или другого агента) в своём проекте и дайте ему одну фразу. Он прочтёт инструкцию, сам поймёт, где работает проект — Docker или Kubernetes, проверит сервер, поставит VTM безопасно (без открытого порта), убедится, что карта видит ваши сервисы, и скажет, как её открыть.</p>
+      <div class="cmd" style="max-width:none">
+        <pre>Поставь VTM на этот проект по инструкции https://snemesh.github.io/vtm-install/agent.md</pre>
+        <button class="copy" type="button" data-copy="Поставь VTM на этот проект по инструкции https://snemesh.github.io/vtm-install/agent.md">Скопировать</button>
+      </div>
+      <p class="hint">Инструкция для агента: <a href="agent.md">agent.md</a> (то же в репозитории — <a href="https://github.com/snemesh/vtm-install/blob/main/AGENTS.md">AGENTS.md</a>). На рабочий сервер агент ставит только после вашего «да».</p>
+    </section>
+
+    <section id="options">
+      <h2>Параметры</h2>
+      <p class="hint" style="margin:-6px 0 16px">Передаются после <code>sh -s --</code>, например: <code>… | sh -s -- --kubernetes --expose loadbalancer</code></p>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Параметр</th><th>Что делает</th></tr></thead>
+          <tbody>
+            <tr><td><code>--docker</code> / <code>--kubernetes</code></td><td>Что показывать, если на машине есть и то и другое</td></tr>
+            <tr><td><code>--version 0.3.0</code></td><td>Конкретный выпуск; по умолчанию — самый новый</td></tr>
+            <tr><td><code>--port 8091</code></td><td>Docker: порт карты (8090)</td></tr>
+            <tr><td><code>--bind 127.0.0.1</code></td><td>Docker: карта только для самого сервера (открывать через SSH-туннель)</td></tr>
+            <tr><td><code>--dir /srv/vtm</code></td><td>Docker: куда ставить (<code>/opt/vtm</code>, без root — <code>~/vtm</code>)</td></tr>
+            <tr><td><code>--namespace vtm</code></td><td>Kubernetes: namespace</td></tr>
+            <tr><td><code>--expose nodeport</code></td><td>Kubernetes: как открыть карту — <code>nodeport</code>, <code>loadbalancer</code>, <code>ingress=map.example.com</code>, <code>none</code></td></tr>
+            <tr><td><code>--check</code></td><td>Только проверить, что карта увидит здесь</td></tr>
+            <tr><td><code>--uninstall</code></td><td>Удалить VTM и его данные</td></tr>
+            <tr><td><code>--yes</code></td><td>Ничего не спрашивать, брать значения по умолчанию</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="faq">
+      <h2>Вопросы</h2>
+      <details>
+        <summary>Как открыть карту рабочего сервера, не открывая порт в интернет?</summary>
+        <div>Поставьте с <code>--bind 127.0.0.1</code> и откройте туннель со своего компьютера:
+          <pre>ssh -L 8090:127.0.0.1:8090 user@server</pre>
+          Затем откройте <code>http://127.0.0.1:8090/</code>.</div>
+      </details>
+      <details>
+        <summary>Забыл пароль карты</summary>
+        <div>Docker: <code>sudo /opt/vtm/vtm.sh password</code>. Kubernetes:
+          <pre>kubectl -n vtm get secret vtm-auth -o jsonpath='{.data.MAP_PASSWORD}' | base64 -d</pre></div>
+      </details>
+      <details>
+        <summary>Что VTM делает с моим проектом?</summary>
+        <div>Ничего не меняет. Читает Docker или Kubernetes API, логи контейнеров и трафик через eBPF. Хранит только счётчики, коды ответов и пути запросов — без тел, заголовков и текста SQL. Свой стек живёт отдельно (Compose-проект <code>vtm</code> или namespace <code>vtm</code>) и на карте не показывается.</div>
+      </details>
+      <details>
+        <summary>Связь нарисована не в ту сторону</summary>
+        <div>В первые минуты после установки так бывает: соединения, открытые до запуска Beyla, ещё не говорят, какая сторона — сервер. Через пять минут направление определяется по слушающему порту и больше не меняется.</div>
+      </details>
+      <details>
+        <summary>Установка остановилась на «429 Too Many Requests»</summary>
+        <div>Docker Hub ограничил анонимные скачивания с вашего адреса. Установщик сам повторяет попытки; если не помогло — подождите час или выполните <code>docker login</code> и запустите снова.</div>
+      </details>
+      <details>
+        <summary>Как обновить или удалить</summary>
+        <div>Обновить — запустить ту же команду ещё раз. Удалить: <code>… | sh -s -- --uninstall</code> (для Kubernetes добавьте <code>--kubernetes</code>) или <code>sudo /opt/vtm/vtm.sh uninstall</code> на Docker-хосте.</div>
+      </details>
+    </section>
+  </main>
+
+  <footer>
+    Образы: <code>ghcr.io/snemesh/vtm-collector</code>, <code>ghcr.io/snemesh/vtm-map</code> (amd64, arm64). Установщик: <a href="https://github.com/snemesh/vtm-install/blob/main/install.sh">install.sh</a> — читайте перед запуском, это обычный POSIX sh.
+  </footer>
+</div>
+<script>
+  for (const b of document.querySelectorAll('.copy')) {
+    b.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(b.dataset.copy); } catch (_) { return; }
+      b.textContent = 'Скопировано'; b.dataset.done = '';
+      setTimeout(() => { b.textContent = 'Скопировать'; delete b.dataset.done; }, 1600);
+    });
+  }
+</script>
+</body>
+</html>

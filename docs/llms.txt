@@ -1,0 +1,6 @@
+# VTM
+
+> Live 3D map of infrastructure for a Docker host or a Kubernetes cluster, installed with one command.
+
+- [Install instructions for AI agents](https://snemesh.github.io/vtm-install/agent.md): step-by-step, for Claude Code and other coding agents asked to "set up VTM" for a project.
+- [Installer](https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh): POSIX sh; `--check`, `--docker`, `--kubernetes`, `--uninstall`.
