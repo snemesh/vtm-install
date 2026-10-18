@@ -63,9 +63,8 @@ The installer prints in Russian. Read the output:
 curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sudo sh -s -- --docker --yes --bind 127.0.0.1
 ```
 
-`--bind 127.0.0.1` keeps the map off the internet: on the same machine it opens at
-http://127.0.0.1:8090/, from elsewhere through an SSH tunnel (step 5). Keep it by default, also on a
-laptop. Leave it out only when the user asks for the map on the network (a LAN address, or a public port —
+`--bind 127.0.0.1` (also the default) keeps the map off the network: on the same machine it opens at
+http://127.0.0.1:8090/, from elsewhere through an SSH tunnel (step 5). Keep it, also on a laptop. Leave it out only when the user asks for the map on the network (a LAN address, or a public port —
 then also suggest their existing reverse proxy with HTTPS in front of it).
 
 **Kubernetes** (needs cluster-admin rights; helm is downloaded if missing):
@@ -74,11 +73,13 @@ then also suggest their existing reverse proxy with HTTPS in front of it).
 curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- --kubernetes --yes --expose none
 ```
 
-`--expose none` keeps the map inside the cluster (open it with port-forward, step 5). If the project
+`--expose none` (also the default) keeps the map inside the cluster (open it with port-forward, step 5). If the project
 already has an ingress controller and a domain, `--expose ingress=<host>` is the better choice; use
-`--expose loadbalancer` or the default NodePort (30890) only if the user wants it reachable directly.
+`--expose loadbalancer` or `--expose nodeport` (30890) only if the user wants it reachable directly.
 
-The installer prints the map's address and password at the end. Keep both for step 6.
+The installer prints how to open the map at the end. It prints the password only to a terminal; run
+from a script (as you do) it prints the command that shows it instead (step 6). Never paste the password
+into files you commit.
 
 ## 4. Verify it works
 
@@ -149,6 +150,7 @@ Optionally offer to give the map readable names: on a Docker host, `/opt/vtm/map
 | map shows the stack but not the project | the project runs elsewhere (another host/cluster/context) — install there |
 | «есть и Docker, и Kubernetes: укажите --docker или --kubernetes» | pass the target you chose in step 1 |
 | `sudo: not found` | you are root already: run the same command without `sudo` |
+| «namespace … уже есть и создан не VTM» | VTM goes into a namespace of its own (it is allowed privileged pods); pick a new `--namespace`, never the project's |
 | Kubernetes pods stuck in rollout | the installer prints the pods that are not ready; `kubectl -n vtm describe pod <name>` tells why |
 
 ## 8. Remove

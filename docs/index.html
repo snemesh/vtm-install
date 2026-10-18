@@ -110,7 +110,7 @@
         <pre id="cmd"><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh</pre>
         <button class="copy" type="button" aria-live="polite" data-copy="curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh">Скопировать</button>
       </div>
-      <p class="hint">Запускайте на сервере с Docker или на машине, где <code>kubectl</code> смотрит в ваш кластер. В конце установщик напечатает адрес карты и пароль.</p>
+      <p class="hint">Запускайте на сервере с Docker или на машине, где <code>kubectl</code> смотрит в ваш кластер. В конце установщик напечатает, как открыть карту, и пароль. По умолчанию карта не открыта в сеть: на сервере — <code>http://127.0.0.1:8090/</code>, со своего компьютера — через SSH-туннель или <code>kubectl port-forward</code>.</p>
 
       <figure class="shot">
         <img src="assets/map.jpg" width="1440" height="900" alt="3D-карта: сервер, на нём приложения проекта и линии трафика между ними" loading="eager">
@@ -135,7 +135,7 @@
           <p>Проект на Docker Compose или просто контейнеры на одном сервере.</p>
           <pre>curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sudo sh</pre>
           <ul>
-            <li>Ставится в <code>/opt/vtm</code>, карта — на <code>http://&lt;IP&nbsp;сервера&gt;:8090/</code></li>
+            <li>Ставится в <code>/opt/vtm</code>, карта — на <code>http://127.0.0.1:8090/</code> самого сервера (снаружи — SSH-туннель, или <code>--bind 0.0.0.0</code>)</li>
             <li>Нужно: Docker с <code>docker compose</code>, Linux amd64 или arm64</li>
             <li>~300&nbsp;МБ памяти, 1–2&nbsp;ГБ диска под метрики, логи и трассы</li>
           </ul>
@@ -146,7 +146,7 @@
           <pre>curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- --kubernetes</pre>
           <ul>
             <li>Helm-чарт в namespace <code>vtm</code>; helm установщик скачает сам</li>
-            <li>Карта на NodePort <code>30890</code> каждого сервера, или LoadBalancer, или Ingress</li>
+            <li>Карта внутри кластера (<code>kubectl port-forward</code>); в сеть — <code>--expose ingress=&lt;домен&gt;</code>, <code>loadbalancer</code> или <code>nodeport</code></li>
             <li>Чарт отдельно: <code>oci://ghcr.io/snemesh/charts/vtm</code></li>
           </ul>
         </div>
@@ -192,10 +192,10 @@
             <tr><td><code>--docker</code> / <code>--kubernetes</code></td><td>Что показывать, если на машине есть и то и другое</td></tr>
             <tr><td><code>--version 0.3.0</code></td><td>Конкретный выпуск; по умолчанию — самый новый</td></tr>
             <tr><td><code>--port 8091</code></td><td>Docker: порт карты (8090)</td></tr>
-            <tr><td><code>--bind 127.0.0.1</code></td><td>Docker: карта только для самого сервера (открывать через SSH-туннель)</td></tr>
+            <tr><td><code>--bind 0.0.0.0</code></td><td>Docker: открыть карту в сеть (по умолчанию <code>127.0.0.1</code> — только сам сервер, снаружи через SSH-туннель)</td></tr>
             <tr><td><code>--dir /srv/vtm</code></td><td>Docker: куда ставить (<code>/opt/vtm</code>, без root — <code>~/vtm</code>)</td></tr>
             <tr><td><code>--namespace vtm</code></td><td>Kubernetes: namespace</td></tr>
-            <tr><td><code>--expose nodeport</code></td><td>Kubernetes: как открыть карту — <code>nodeport</code>, <code>loadbalancer</code>, <code>ingress=map.example.com</code>, <code>none</code></td></tr>
+            <tr><td><code>--expose ingress=map.example.com</code></td><td>Kubernetes: как открыть карту — <code>none</code> (по умолчанию: <code>kubectl port-forward</code>), <code>ingress=&lt;домен&gt;</code>, <code>loadbalancer</code>, <code>nodeport</code></td></tr>
             <tr><td><code>--set storage.className=fast</code></td><td>Kubernetes: любое значение чарта (можно несколько раз)</td></tr>
             <tr><td><code>--check</code></td><td>Только проверить, что карта увидит здесь</td></tr>
             <tr><td><code>--uninstall</code></td><td>Удалить VTM и его данные</td></tr>
@@ -210,13 +210,13 @@
       <h2>Вопросы</h2>
       <details>
         <summary>Как открыть карту рабочего сервера, не открывая порт в интернет?</summary>
-        <div>Поставьте с <code>--bind 127.0.0.1</code> и откройте туннель со своего компьютера:
+        <div>Так и ставится по умолчанию: карта слушает только <code>127.0.0.1</code>. Откройте туннель со своего компьютера:
           <pre>ssh -L 8090:127.0.0.1:8090 user@server</pre>
           Затем откройте <code>http://127.0.0.1:8090/</code>.</div>
       </details>
       <details>
         <summary>Карта открывается по HTTP. Это безопасно?</summary>
-        <div>Карта сама не делает HTTPS. По сети пароль идёт открытым текстом, поэтому по умолчанию для рабочих серверов — <code>--bind 127.0.0.1</code> и SSH-туннель, а для доступа извне — ваш обратный прокси с HTTPS перед картой (в Kubernetes — <code>--expose ingress=&lt;домен&gt;</code> с TLS на ingress). Порт Beyla (9400) на Docker-хосте закрыт для внешних адресов правилом VTM-GUARD, которое ставит сам VTM и убирает при удалении.</div>
+        <div>Карта сама не делает HTTPS: по сети пароль шёл бы открытым текстом. Поэтому по умолчанию она в сеть не открыта (Docker — только <code>127.0.0.1</code>, Kubernetes — только внутри кластера), а для доступа извне ставьте перед ней свой прокси с HTTPS (в Kubernetes — <code>--expose ingress=&lt;домен&gt;</code> с TLS на ingress). Служебные порты на самом сервере (метрики Beyla 9400, в Docker ещё blackbox 9115) закрыты правилом файрвола VTM-GUARD: их видят только сервер, сеть стека, а в Kubernetes ещё сети кластера. VTM ставит это правило сам и убирает при удалении. В Kubernetes хранилища логов, метрик и трасс пускают только с токеном стека, даже там, где сеть кластера не применяет NetworkPolicy.</div>
       </details>
       <details>
         <summary>Забыл пароль карты</summary>
@@ -225,7 +225,7 @@
       </details>
       <details>
         <summary>Что VTM делает с моим проектом?</summary>
-        <div>Ничего в нём не меняет. Читает Docker или Kubernetes API, логи контейнеров и трафик через eBPF. Хранит у вас же, на этом сервере или в кластере: счётчики трафика и запросов, коды ответов, логи контейнеров (30 дней) и трассы запросов с путями — без тел и заголовков. Наружу ничего не отправляет. Свой стек живёт отдельно (Compose-проект <code>vtm</code> или namespace <code>vtm</code>) и на карте не показывается.</div>
+        <div>Ничего в нём не меняет: ни файлов, ни образов, ни трафика (Beyla ничего не дописывает в запросы приложений). Права — только чтение. Читает Docker или Kubernetes API, логи контейнеров и трафик через eBPF. Хранит у вас же, на этом сервере или в кластере: счётчики трафика и запросов, коды ответов, логи контейнеров (30 дней) и трассы запросов с путями — без тел и заголовков. Наружу ничего не отправляет. Свой стек живёт отдельно (Compose-проект <code>vtm</code> или namespace <code>vtm</code>) и на карте не показывается.</div>
       </details>
       <details>
         <summary>Связь нарисована не в ту сторону</summary>

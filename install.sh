@@ -9,10 +9,10 @@
 # Options (all optional):
 #   --docker | --kubernetes   which one, when both are here (otherwise it asks, or takes the only one)
 #   --version X               a release (0.3.0); default latest
-#   --port N --bind ADDR      Docker: the map's port (8090) and address (0.0.0.0; 127.0.0.1 for this host only)
+#   --port N --bind ADDR      Docker: the map's port (8090) and address (127.0.0.1: this host only; 0.0.0.0 the network)
 #   --dir DIR                 Docker: where the stack lives (/opt/vtm, or ~/vtm without root)
 #   --namespace NS            Kubernetes: the namespace (vtm)
-#   --expose KIND             Kubernetes: nodeport (default), loadbalancer, ingress=<host>, none
+#   --expose KIND             Kubernetes: none (default: port-forward), nodeport, loadbalancer, ingress=<host>
 #   --set key=value           Kubernetes: a value of the chart (e.g. storage.className=fast), repeatable
 #   --check                   only check what the map would see here, install nothing
 #   --uninstall               remove VTM (and its data) from here
@@ -25,7 +25,7 @@ VTM_CHART=${VTM_CHART:-oci://ghcr.io/snemesh/charts/vtm}
 HELM_VERSION=${HELM_VERSION:-v3.18.4}
 version=${VTM_VERSION:-latest}
 version_given='' sets='' # sets: the --set values, one per line
-platform='' port='' bind='' dir='' ns=vtm expose=nodeport action=install yes=''
+platform='' port='' bind='' dir='' ns=vtm expose='' action=install yes=''
 
 say() { printf '%s\n' "$*"; }
 # The help is text of its own: with `curl … | sh` there is no file to read it from.
@@ -35,10 +35,10 @@ VTM installer: the live 3D map of a Docker host or a Kubernetes cluster. https:/
   curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- [options]
   --docker | --kubernetes   which one, when both are here
   --version X               a release (0.3.0); default the newest build
-  --port N --bind ADDR      Docker: the map's port (8090) and address (0.0.0.0; 127.0.0.1 = this host only)
+  --port N --bind ADDR      Docker: the map's port (8090) and address (127.0.0.1 = this host only, default; 0.0.0.0 = the network)
   --dir DIR                 Docker: where the stack lives (/opt/vtm, or ~/vtm without root)
   --namespace NS            Kubernetes: the namespace (vtm)
-  --expose KIND             Kubernetes: nodeport (default), loadbalancer, ingress=<host>, none
+  --expose KIND             Kubernetes: none (default: kubectl port-forward), nodeport, loadbalancer, ingress=<host>
   --set key=value           Kubernetes: a value of the chart, e.g. storage.className=fast (repeatable)
   --check                   only check what the map would see here
   --uninstall               remove VTM and its data
@@ -283,15 +283,34 @@ kube_release_storage() {
     | sed -n 's/^"\([a-z0-9-]*\)":"\([0-9A-Za-z.]*\)"$/storage.sizes.\1=\2/p'
 }
 
+# How the installed release opens the map, as an --expose value (empty: no release).
+kube_release_expose() {
+  [ -n "${helm:-}" ] || return 0
+  v=$("$helm" get values vtm --namespace "$ns" -a -o json 2>/dev/null | tr -d ' \n') || return 0
+  [ -n "$v" ] || return 0
+  t=$(printf '%s' "$v" | sed -n 's/.*"service":{[^}]*"type":"\([A-Za-z]*\)".*/\1/p' | head -n 1)
+  h=$(printf '%s' "$v" | sed -n 's/.*"ingress":{.*"enabled":true.*"host":"\([^"]*\)".*/\1/p' | head -n 1)
+  case "$t" in
+    NodePort) echo nodeport ;;
+    LoadBalancer) echo loadbalancer ;;
+    ClusterIP) if [ -n "$h" ]; then echo "ingress=$h"; else echo none; fi ;;
+  esac
+}
+
 kube_install() {
   helm=$(helm_cmd)
   kube_check
   # The namespace, labelled so that the cluster's Pod Security lets Beyla, Alloy and node-exporter in (they
   # read the servers: host network and processes, kernel tracing; «baseline» or «restricted» refuse them),
-  # and marked as VTM's, so that uninstall removes only a namespace VTM made.
+  # and marked as VTM's, so that uninstall removes only a namespace VTM made. A namespace of the cluster's
+  # own is never used: the label would let every pod there run privileged, on the server's processes and
+  # disks (only one that already holds VTM's release, from an installer before the mark, is kept).
   if ! kubectl get namespace "$ns" >/dev/null 2>&1; then
     kubectl create namespace "$ns" >/dev/null
     kubectl label namespace "$ns" app.kubernetes.io/managed-by=vtm-install >/dev/null
+  elif [ "$(kubectl get namespace "$ns" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null)" != vtm-install ] \
+    && ! "$helm" status vtm --namespace "$ns" >/dev/null 2>&1; then
+    die "namespace $ns уже есть и создан не VTM. VTM ставится в свой namespace: в нём разрешены привилегированные поды, и в чужом это разрешение получили бы все. Укажите новый, которого ещё нет: --namespace vtm-map"
   fi
   kubectl label namespace "$ns" --overwrite pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/warn=privileged >/dev/null \
     || die "не удалось разрешить привилегированные поды в namespace $ns (нужны права администратора)"
@@ -309,6 +328,11 @@ kube_install() {
   set -- "$@" --set "beyla.cidrs={10.42.0.0/16,10.43.0.0/16,10.244.0.0/16,10.96.0.0/12${kube_cidrs:+,$kube_cidrs}}"
   # What the check found, as a JSON list (the lines have no quotes of their own).
   [ -z "$kube_limits" ] || set -- "$@" --set-json "hostLimits=[\"$(printf '%s' "$kube_limits" | sed 's/;/","/g')\"]"
+  # How the map is reached: what was asked; else what the installed release has (a re-run changes
+  # nothing); else inside the cluster only (port-forward): the map is plain HTTP, and its password and
+  # the error lines of every app should not cross a network unasked.
+  [ -n "$expose" ] || expose=$(kube_release_expose)
+  [ -n "$expose" ] || expose=none
   case "$expose" in
     nodeport) set -- "$@" --set map.service.type=NodePort ;;
     loadbalancer) set -- "$@" --set map.service.type=LoadBalancer ;;
@@ -360,9 +384,13 @@ kube_install() {
       fi
       ;;
     ingress=*) say "VTM работает:  http://${expose#ingress=}/   (пока имя не ведёт на ingress-контроллер кластера — kubectl -n $ns port-forward svc/vtm-map 8090:80)" ;;
-    none) say "VTM работает внутри кластера: kubectl -n $ns port-forward svc/vtm-map 8090:80 → http://127.0.0.1:8090/" ;;
+    none)
+      say "VTM работает внутри кластера. Открыть: kubectl -n $ns port-forward svc/vtm-map 8090:80, затем http://127.0.0.1:8090/"
+      say "Открыть в сеть: запустите установщик с --expose ingress=<домен> (HTTPS — на ingress) или --expose loadbalancer."
+      ;;
   esac
-  say "Пароль:        $pass"
+  # The password only on a terminal: from a script (CI, an agent) it would stay in their logs.
+  if [ -t 1 ]; then say "Пароль:        $pass"; else say "Пароль:        kubectl -n $ns get secret vtm-auth -o jsonpath='{.data.MAP_PASSWORD}' | base64 -d"; fi
   say "Карта наполнится за две-три минуты. Обновить: запустите установщик ещё раз; удалить: --uninstall."
 }
 
