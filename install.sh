@@ -78,7 +78,11 @@ while [ $# -gt 0 ]; do
     --limit) limits="$limits ${2:?--limit needs part=size}"; shift ;;
     --https)
       https=auto
-      case "${2:-}" in auto | on | internal | self-signed | off) https=$2; shift ;; esac
+      case "${2:-}" in
+        auto | on) https=auto; shift ;;
+        internal | self-signed) https=internal; shift ;;
+        off) https=off; shift ;;
+      esac
       ;;
     --domain) domain=${2:?--domain needs a name}; shift ;;
     --status) action=status ;;
@@ -175,10 +179,9 @@ docker_install() {
   fi
   # One VTM per host: another folder's stack is updated there, not doubled here (vtm.sh checks it too).
   # Paths compared as the filesystem has them (a relative or symlinked --dir is the same folder).
-  other=''
-  for w in $(docker ps -a --filter label=com.docker.compose.project=vtm --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u); do
-    [ "$(canon "$w")" = "$(canon "$d")" ] || { other=$w; break; }
-  done
+  # One path per line (a folder's name may have spaces).
+  other=$(docker ps -a --filter label=com.docker.compose.project=vtm --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u \
+    | while IFS= read -r w; do [ "$(canon "$w")" = "$(canon "$d")" ] || { echo "$w"; break; }; done)
   [ -z "$other" ] || die "на этом сервере уже работает VTM ($other): второй не ставится. Обновить его: --dir $other; удалить: --dir $other --uninstall."
   docker_pull "$image"
   # The stack's files come out of the image (/bundle/docker): .env (passwords, settings) and a map.config.json
@@ -226,7 +229,9 @@ docker_uninstall() {
 
 # ---------- Kubernetes ----------
 helm_cmd() {
-  # Helm 3.14 or newer: --reset-then-reuse-values keeps what earlier runs set (limits, names, storage).
+  # Installing needs Helm 3.14 or newer (--reset-then-reuse-values keeps what earlier runs set: limits,
+  # names, storage); removing works with any (helm_cmd any).
+  if has helm && [ "${1:-}" = any ]; then echo helm; return; fi
   if has helm; then
     hv=$(helm version --template '{{.Version}}' 2>/dev/null | tr -d v)
     hmaj=$(echo "$hv" | cut -d. -f1) hmin=$(echo "$hv" | cut -d. -f2)
@@ -328,15 +333,19 @@ kube_check() {
   fi
 }
 
+# The last --set of a key (Helm takes the rightmost one).
+set_value() { printf '%s' "$sets" | sed -n "s/^$(echo "$1" | sed 's/\./\\./g')=//p" | tail -n 1; }
+
 # The stores' disks will be made: the class chosen (storage.className, else the cluster's default) has a
 # working provisioner. A class of a cloud's old in-tree plugin (EKS's gp2: kubernetes.io/aws-ebs) makes
 # disks only through that cloud's CSI driver since Kubernetes 1.23; without the driver the claims stay
 # Pending forever — stop before installing, with the ways out.
 kube_storage_check() {
-  printf '%s' "$sets" | grep -qx 'storage\.ephemeral=true' && return 0
+  [ "$(set_value storage.ephemeral)" != true ] || return 0
   cls=$(printf '%s' "$sets" | sed -n 's/^storage\.className=//p' | tail -n 1)
   [ -n "$cls" ] || cls=$(kube_release_class)
-  [ -n "$cls" ] || cls=$(kubectl get storageclass -o jsonpath='{range .items[*]}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class} {.metadata.name}{"\n"}{end}' 2>/dev/null | sed -n 's/^true //p' | head -n 1)
+  # Several defaults (during a migration): Kubernetes takes the newest one.
+  [ -n "$cls" ] || cls=$(kubectl get storageclass --sort-by=.metadata.creationTimestamp -o jsonpath='{range .items[*]}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class} {.metadata.name}{"\n"}{end}' 2>/dev/null | sed -n 's/^true //p' | tail -n 1)
   [ -n "$cls" ] || return 0
   prov=$(kubectl get storageclass "$cls" -o jsonpath='{.provisioner}' 2>/dev/null) \
     || die "StorageClass $cls нет в кластере (есть: $(kubectl get storageclass -o name 2>/dev/null | sed 's|.*/||' | tr '\n' ' '))"
@@ -363,6 +372,19 @@ kube_storage_check() {
   die "  3) хранить без дисков: --set storage.ephemeral=true (метрики, логи и трассы пропадут при перезапуске их пода)"
 }
 
+# The installed release's storage class and sizes as it runs with them (defaults included), as --set
+# values (storage.sizes.loki=50Gi), one per line.
+kube_release_storage() {
+  [ -n "${helm:-}" ] || return 0
+  st=$("$helm" get values vtm --namespace "$ns" -a -o json 2>/dev/null | tr -d ' \n' \
+    | sed -n 's/.*"storage":{\("className"[^}]*}\).*/\1/p' | head -n 1)
+  [ -n "$st" ] || return 0
+  c=$(printf '%s' "$st" | sed -n 's/.*"className":"\([^"]*\)".*/\1/p')
+  [ -z "$c" ] || echo "storage.className=$c"
+  printf '%s' "$st" | sed -n 's/.*"sizes":{\([^}]*\)}.*/\1/p' | tr ',' '\n' \
+    | sed -n 's/^"\([a-z0-9-]*\)":"\([0-9A-Za-z.]*\)"$/storage.sizes.\1=\2/p'
+}
+
 # The installed release's StorageClass (empty when there is none or it uses the default).
 kube_release_class() {
   [ -n "${helm:-}" ] || return 0
@@ -374,7 +396,7 @@ kube_release_class() {
 # class that cannot make disks is told at once, not after the ten minutes of the rollout.
 kube_wait_disks() {
   [ -z "$kube_ephemeral" ] || return 0
-  printf '%s' "$sets" | grep -qx 'storage\.ephemeral=true' && return 0
+  [ "$(set_value storage.ephemeral)" != true ] || return 0
   i=0
   while [ $i -lt 24 ]; do
     pending=$(kubectl -n "$ns" get pvc -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase}{"\n"}{end}' 2>/dev/null | awk '$2 != "Bound" {print $1}')
@@ -423,6 +445,8 @@ kube_limit_sets() {
 
 # How the map is reached, read from the cluster (the Ingress vtm-map, else the Service's type).
 kube_address() {
+  # wait: the address of a new load balancer is waited for (after installing); --status only reports.
+  tries=1; [ "${1:-}" = wait ] && tries=30
   host=$(kubectl -n "$ns" get ingress vtm-map -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || true)
   if [ -n "$host" ]; then
     scheme=http
@@ -450,15 +474,15 @@ kube_address() {
       ;;
     LoadBalancer)
       i=0 lb=''
-      while [ $i -lt 30 ] && [ -z "$lb" ]; do
+      while [ $i -lt "$tries" ] && [ -z "$lb" ]; do
         lb=$(kubectl -n "$ns" get svc vtm-map -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}')
-        [ -n "$lb" ] || sleep 4
+        [ -n "$lb" ] || [ "$tries" = 1 ] || sleep 4
         i=$((i + 1))
       done
       if [ -n "$lb" ]; then
         say "VTM работает:  http://$lb/   (HTTP; для HTTPS — --expose ingress=<имя> --https)"
       else
-        say "VTM работает, но балансировщик за 2 минуты не дал адреса (в кластере его может не быть)."
+        say "VTM работает, но у балансировщика пока нет адреса (в кластере его может не быть)."
         say "Пока: kubectl -n $ns port-forward svc/vtm-map 8090:80 → http://127.0.0.1:8090/   Адрес позже: kubectl -n $ns get svc vtm-map"
       fi
       ;;
@@ -479,12 +503,16 @@ is_private() {
 kube_ingress_address() {
   # The controller's own Service (Traefik, ingress-nginx, HAProxy, Contour/Envoy, Kong, Istio's gateway):
   # another load balancer of the cluster on 443 is not where the ingress is.
-  a=$(kubectl get svc -A -o go-template='{{range .items}}{{if eq .spec.type "LoadBalancer"}}{{.metadata.name}} {{index .metadata.labels "app.kubernetes.io/name"}} {{range .status.loadBalancer.ingress}}{{.ip}}{{end}}{{"\n"}}{{end}}{{end}}' 2>/dev/null \
-    | grep -Ei '^[^ ]*(traefik|ingress-nginx|ingress-controller|haproxy|envoy|contour|kong|istio-ingressgateway)' \
-    | awk '{print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
-  [ -n "$a" ] || a=$(kubectl get svc -A -o go-template='{{range .items}}{{if eq .spec.type "LoadBalancer"}}{{index .metadata.labels "app.kubernetes.io/name"}} {{range .status.loadBalancer.ingress}}{{.ip}}{{end}}{{"\n"}}{{end}}{{end}}' 2>/dev/null \
-    | grep -Ei '^(traefik|ingress-nginx|rke2-ingress-nginx|haproxy-ingress|contour|envoy|kong|istio-ingressgateway) ' \
-    | awk '{print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+  # Each LoadBalancer: "name app-label ip hostname" (- for none).
+  lbs=$(kubectl get svc -A -o go-template='{{range .items}}{{if eq .spec.type "LoadBalancer"}}{{.metadata.name}} {{or (index .metadata.labels "app.kubernetes.io/name") "-"}} {{range .status.loadBalancer.ingress}}{{or .ip "-"}} {{or .hostname "-"}}{{end}}{{"\n"}}{{end}}{{end}}' 2>/dev/null \
+    | grep -Ei '^[^ ]*(traefik|ingress-nginx|ingress-controller|haproxy|envoy|contour|kong|istio-ingressgateway)|^[^ ]+ (traefik|ingress-nginx|rke2-ingress-nginx|haproxy-ingress|contour|envoy|kong|istio-ingressgateway) ' || true)
+  a=$(echo "$lbs" | awk '{print $3}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+  # A controller behind a load balancer with a DNS name only (AWS): the servers' addresses do not lead to
+  # its 443, so no <IP>.sslip.io; a name of the user's (a CNAME to it) does.
+  if [ -z "$a" ]; then
+    h=$(echo "$lbs" | awk '$4 != "-" && $4 != "" {print $4}' | head -n 1)
+    [ -z "$h" ] || die "ingress-контроллер стоит за балансировщиком с DNS-именем $h, а не с IP: ingress=auto здесь не подходит. Заведите имя (CNAME на $h) и укажите его: --expose ingress=<имя> --https"
+  fi
   [ -n "$a" ] || a=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' 2>/dev/null | grep -E '^[0-9.]+$' | head -n 1)
   if [ -z "$a" ]; then
     for ip in $(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' 2>/dev/null); do
@@ -497,7 +525,10 @@ kube_ingress_address() {
 # Memory of every container of VTM now against its limit, restarts and why the last one ended (OOMKilled:
 # the limit is too low), and the map's address.
 kube_status() {
-  kubectl get namespace "$ns" >/dev/null 2>&1 || die "в кластере нет namespace $ns (VTM в другом: --namespace)"
+  [ -n "$(kubectl -n "$ns" get daemonset -l app.kubernetes.io/part-of=vtm -o name 2>/dev/null)" ] || {
+    other=$(kube_other_vtm | head -n 1)
+    die "в namespace $ns нет VTM${other:+ (он в namespace $other: --namespace $other)}"
+  }
   kubectl -n "$ns" get pods -o wide
   say ""
   kube_address
@@ -555,9 +586,12 @@ kube_install() {
     || die "не удалось разрешить привилегированные поды в namespace $ns (нужны права администратора)"
   # No helm --wait: it would wait for a load balancer's address that some clusters never give. The pods are
   # waited for below, the address after that.
-  # --reset-then-reuse-values: what earlier runs set stays (memory limits, the map's names, the disks' class
-  # and sizes — a StatefulSet's disks cannot change), on the new chart's defaults; this run's values win.
+  # --reset-then-reuse-values: what earlier runs set stays (memory limits, the map's names, HTTPS), on the
+  # new chart's defaults; this run's values win.
   set -- upgrade --install vtm "$VTM_CHART" --namespace "$ns" --timeout 10m --reset-then-reuse-values
+  # The disks as installed, defaults included (a later chart's other default size would change a
+  # StatefulSet's disks, which cannot change in place).
+  for kv in $(kube_release_storage); do set -- "$@" --set "$kv"; done
   # latest: the newest chart, the main branch's builds included (they are pre-releases of the next
   # version, 1.2.4-main.N, newer than the release 1.2.3); a version: exactly that release.
   if [ "$version" = latest ]; then set -- "$@" --devel --set image.tag=; else set -- "$@" --version "$version" --set "image.tag=$version"; fi
@@ -571,7 +605,8 @@ kube_install() {
   else
     set -- "$@" --set-json 'hostLimits=[]'
   fi
-  for kv in $(kube_limit_sets); do set -- "$@" --set "$kv"; done
+  lsets=$(kube_limit_sets) || exit 1 # a wrong --limit stops here (die inside $(...) would not)
+  for kv in $lsets; do set -- "$@" --set "$kv"; done
   # How the map is reached: what was asked; else what the installed release has (a re-run changes
   # nothing); else inside the cluster only (port-forward): the map's password and the error lines of every
   # app should not cross a network unasked.
@@ -597,7 +632,8 @@ kube_install() {
       set -- "$@" --set map.ingress.tls=true
       issuer=$(printf '%s' "$sets" | sed -n 's/^map\.ingress\.clusterIssuer=//p' | tail -n 1)
       if [ -z "$issuer" ]; then
-        issuers=$(kubectl get clusterissuers.cert-manager.io -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+        # Only issuers cert-manager calls Ready (a stale one would never give the certificate).
+        issuers=$(kubectl get clusterissuers.cert-manager.io -o jsonpath='{range .items[*]}{.metadata.name} {.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null | sed -n 's/ True$//p' || true)
         # The production one of Let's Encrypt when there are several (not its staging).
         issuer=$(echo "$issuers" | grep -i prod | head -n 1)
         [ -n "$issuer" ] || issuer=$(echo "$issuers" | grep -vi staging | head -n 1)
@@ -607,7 +643,7 @@ kube_install() {
         say "HTTPS: сертификат выпустит cert-manager (ClusterIssuer $issuer)."
       else
         set -- "$@" --set map.ingress.clusterIssuer=
-        warn "в кластере нет cert-manager (ClusterIssuer): HTTPS будет с сертификатом ingress-контроллера, браузер предупредит. Настоящий сертификат — поставьте cert-manager и запустите установщик снова."
+        warn "в кластере нет готового ClusterIssuer cert-manager: HTTPS будет с сертификатом ingress-контроллера, браузер предупредит. Настоящий сертификат — cert-manager с готовым ClusterIssuer (или --set map.ingress.clusterIssuer=<имя>), затем установщик снова."
       fi
       ;;
   esac
@@ -639,7 +675,7 @@ kube_install() {
   done
   pass=$(kubectl -n "$ns" get secret vtm-auth -o jsonpath='{.data.MAP_PASSWORD}' | base64 -d)
   say ""
-  kube_address
+  kube_address wait
   # The password only on a terminal: from a script (CI, an agent) it would stay in their logs.
   if [ -t 1 ]; then say "Пароль:        $pass"; else say "Пароль:        kubectl -n $ns get secret vtm-auth -o jsonpath='{.data.MAP_PASSWORD}' | base64 -d"; fi
   say "Карта наполнится за две-три минуты. Память и перезапуски: --status; лимит памяти: --limit beyla=3Gi."
@@ -650,7 +686,7 @@ kube_uninstall() {
   a=$(ask "Удалить VTM из кластера $(kubectl config current-context) (namespace $ns и все его данные)? [y/N]") || a=${yes:+y}
   case "$a" in
     y | Y | д | Д | yes)
-      helm=$(helm_cmd)
+      helm=$(helm_cmd any)
       "$helm" uninstall vtm --namespace "$ns" --wait --timeout 5m >/dev/null || true
       kubectl -n "$ns" delete secret vtm-auth --ignore-not-found >/dev/null
       # The namespace goes only when VTM made it; a namespace of the user's keeps its other things.
