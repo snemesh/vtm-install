@@ -12,8 +12,15 @@
 #   --port N --bind ADDR      Docker: the map's port (8090) and address (127.0.0.1: this host only; 0.0.0.0 the network)
 #   --dir DIR                 Docker: where the stack lives (/opt/vtm, or ~/vtm without root)
 #   --namespace NS            Kubernetes: the namespace (vtm)
-#   --expose KIND             Kubernetes: none (default: port-forward), nodeport, loadbalancer, ingress=<host>
+#   --expose KIND             Kubernetes: none (default: port-forward), nodeport, loadbalancer,
+#                             ingress=<host|auto>; a re-run without it keeps how the installed map is reached
 #   --set key=value           Kubernetes: a value of the chart (e.g. storage.className=fast), repeatable
+#   --https [auto|internal|off]  HTTPS for the map: auto = Let's Encrypt (Docker: the host's --domain or
+#                             <address>.sslip.io; Kubernetes: the ingress, through cert-manager), internal =
+#                             a certificate of its own (the browser warns once), off; kept on later runs
+#   --domain NAME             the map's name for HTTPS (Docker; in Kubernetes: --expose ingress=NAME)
+#   --limit part=size         a part's memory limit (beyla=3Gi), repeatable; kept on later runs
+#   --status                  what runs: memory of every part against its limit, restarts, the address
 #   --check                   only check what the map would see here, install nothing
 #   --uninstall               remove VTM (and its data) from here
 #   --yes                     never ask: take the defaults
@@ -24,8 +31,9 @@ VTM_IMAGES=${VTM_IMAGES:-ghcr.io/snemesh}
 VTM_CHART=${VTM_CHART:-oci://ghcr.io/snemesh/charts/vtm}
 HELM_VERSION=${HELM_VERSION:-v3.18.4}
 version=${VTM_VERSION:-latest}
-version_given='' sets='' # sets: the --set values, one per line
+version_given='' sets='' limits='' # sets: the --set values, one per line; limits: part=size, space-separated
 platform='' port='' bind='' dir='' ns=vtm expose='' action=install yes=''
+https='' domain=''
 
 say() { printf '%s\n' "$*"; }
 # The help is text of its own: with `curl … | sh` there is no file to read it from.
@@ -38,8 +46,14 @@ VTM installer: the live 3D map of a Docker host or a Kubernetes cluster. https:/
   --port N --bind ADDR      Docker: the map's port (8090) and address (127.0.0.1 = this host only, default; 0.0.0.0 = the network)
   --dir DIR                 Docker: where the stack lives (/opt/vtm, or ~/vtm without root)
   --namespace NS            Kubernetes: the namespace (vtm)
-  --expose KIND             Kubernetes: none (default: kubectl port-forward), nodeport, loadbalancer, ingress=<host>
+  --expose KIND             Kubernetes: none (default: kubectl port-forward), nodeport, loadbalancer,
+                            ingress=<host|auto> (a re-run without it keeps the installed one)
   --set key=value           Kubernetes: a value of the chart, e.g. storage.className=fast (repeatable)
+  --https [auto|internal|off]  HTTPS for the map: auto = Let's Encrypt (Docker: --domain or <IP>.sslip.io;
+                            Kubernetes: the ingress via cert-manager), internal = own certificate, off
+  --domain NAME             Docker: the map's domain for HTTPS
+  --limit part=size         memory limit of a part, e.g. beyla=3Gi (repeatable; kept on later runs)
+  --status                  memory of every part against its limit, restarts, the map's address
   --check                   only check what the map would see here
   --uninstall               remove VTM and its data
   --yes                     never ask
@@ -61,6 +75,17 @@ while [ $# -gt 0 ]; do
     --expose) expose=${2:?--expose needs a value}; shift ;;
     --set) sets="$sets${2:?--set needs key=value}
 "; shift ;;
+    --limit) limits="$limits ${2:?--limit needs part=size}"; shift ;;
+    --https)
+      https=auto
+      case "${2:-}" in
+        auto | on) https=auto; shift ;;
+        internal | self-signed) https=internal; shift ;;
+        off) https=off; shift ;;
+      esac
+      ;;
+    --domain) domain=${2:?--domain needs a name}; shift ;;
+    --status) action=status ;;
     --check) action=check ;;
     --uninstall) action=uninstall ;;
     --yes | -y) yes=1 ;;
@@ -119,6 +144,9 @@ docker_dir() {
   if [ "$(id -u)" = 0 ]; then echo /opt/vtm; else echo "$HOME/vtm"; fi
 }
 
+# A folder's path with symlinks and . resolved (as given when it does not exist yet).
+canon() { if [ -d "$1" ]; then (cd "$1" && pwd -P); else echo "$1"; fi; }
+
 docker_ready() {
   has docker || die "Docker не установлен."
   docker info >/dev/null 2>&1 || die "Docker не отвечает этому пользователю: запустите от root (… | sudo sh) или добавьте пользователя в группу docker."
@@ -149,6 +177,12 @@ docker_install() {
     && ! { [ -f "$d/vtm.sh" ] && grep -q '^name: vtm$' "$d/compose.yml" 2>/dev/null; }; then
     die "в $d уже есть другие файлы: VTM ставится в свою, пустую папку (укажите другую: --dir)."
   fi
+  # One VTM per host: another folder's stack is updated there, not doubled here (vtm.sh checks it too).
+  # Paths compared as the filesystem has them (a relative or symlinked --dir is the same folder).
+  # One path per line (a folder's name may have spaces).
+  other=$(docker ps -a --filter label=com.docker.compose.project=vtm --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u \
+    | while IFS= read -r w; do [ "$(canon "$w")" = "$(canon "$d")" ] || { echo "$w"; break; }; done)
+  [ -z "$other" ] || die "на этом сервере уже работает VTM ($other): второй не ставится. Обновить его: --dir $other; удалить: --dir $other --uninstall."
   docker_pull "$image"
   # The stack's files come out of the image (/bundle/docker): .env (passwords, settings) and a map.config.json
   # of the installation's own stay as they are.
@@ -165,7 +199,7 @@ docker_install() {
   # What is asked this time (a version given with --version, port, address) changes an installation made
   # before; a re-run without --version keeps the version it has.
   VTM_VERSION_SET=${version_given:+$version} VTM_PORT_SET=$port VTM_BIND_SET=$bind VTM_IMAGES=$VTM_IMAGES \
-    "$d/vtm.sh" up
+    VTM_LIMITS_SET=$limits VTM_HTTPS_SET=$https VTM_DOMAIN_SET=$domain "$d/vtm.sh" up
 }
 
 docker_check() {
@@ -178,6 +212,13 @@ docker_check() {
   rm -rf "$d"
 }
 
+docker_status() {
+  docker_ready
+  d=$(docker_dir)
+  [ -x "$d/vtm.sh" ] || die "в $d нет VTM (другая папка: --dir)"
+  "$d/vtm.sh" status
+}
+
 docker_uninstall() {
   docker_ready
   d=$(docker_dir)
@@ -188,7 +229,15 @@ docker_uninstall() {
 
 # ---------- Kubernetes ----------
 helm_cmd() {
-  if has helm; then echo helm; return; fi
+  # Installing needs Helm 3.14 or newer (--reset-then-reuse-values keeps what earlier runs set: limits,
+  # names, storage); removing works with any (helm_cmd any).
+  if has helm && [ "${1:-}" = any ]; then echo helm; return; fi
+  if has helm; then
+    hv=$(helm version --template '{{.Version}}' 2>/dev/null | tr -d v)
+    hmaj=$(echo "$hv" | cut -d. -f1) hmin=$(echo "$hv" | cut -d. -f2)
+    if [ "${hmaj:-0}" -gt 3 ] 2>/dev/null || { [ "${hmaj:-0}" -eq 3 ] && [ "${hmin:-0}" -ge 14 ]; } 2>/dev/null; then echo helm; return; fi
+    say "helm $hv старше 3.14: для установки беру свежий во временную папку." >&2
+  fi
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
   case "$(uname -m)" in x86_64 | amd64) arch=amd64 ;; aarch64 | arm64) arch=arm64 ;; *) die "нет helm, и для $(uname -m) его не скачать: поставьте helm сами" ;; esac
   # A folder of its own each time (mktemp -d: only this user can write there), and the archive checked
@@ -206,10 +255,28 @@ helm_cmd() {
   echo "$hdir/$os-$arch/helm"
 }
 
-kube_limits='' kube_cidrs='' kube_ephemeral=''
+# Another VTM in the cluster: the namespaces of VTM's DaemonSets other than this one. One VTM per cluster
+# (a second would draw every app twice and its Beyla would fight the first for port 9400 on the servers).
+kube_other_vtm() {
+  kubectl get daemonset -A -l app.kubernetes.io/part-of=vtm -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null \
+    | sort -u | grep -vx "$ns" || true
+}
+
+kube_limits='' kube_cidrs='' kube_ephemeral='' kube_nodeport=''
 kube_check() {
   ctx=$(kubectl config current-context 2>/dev/null || echo '?')
   say "Кластер: $ctx"
+  other=$(kube_other_vtm | head -n 1)
+  [ -z "$other" ] || die "в кластере уже работает VTM (namespace $other): второй не ставится — он показывал бы всё дважды и спорил бы с первым за порт 9400 на серверах. Обновить тот: --namespace $other; удалить его: --namespace $other --uninstall."
+  # Port 9400 of the servers (Beyla's metrics, host network): taken by another program in the cluster?
+  taken=$(kubectl get pods -A -o go-template='{{range .items}}{{$n := printf "%s/%s" .metadata.namespace .metadata.name}}{{$h := .spec.hostNetwork}}{{range .spec.containers}}{{range .ports}}{{if or (eq (print .hostPort) "9400") (and $h (eq (print .containerPort) "9400"))}}{{$n}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}' 2>/dev/null | grep -v "^$ns/" | head -n 1 || true)
+  [ -z "$taken" ] || die "порт 9400 на серверах занят подом $taken; Beyla VTM слушает этот порт в сети сервера и не запустится."
+  # NodePort 30890 of the map: taken by a service other than VTM's own? Then the cluster picks a free one.
+  kube_nodeport=''
+  if { [ "$expose" = nodeport ] || { [ -z "$expose" ] && [ "$(kube_release_expose)" = nodeport ]; }; } && kubectl get svc -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{range .spec.ports[*]} {.nodePort}{end}{"\n"}{end}' 2>/dev/null \
+    | grep -v "^$ns/vtm-map " | grep -q ' 30890\( \|$\)'; then
+    kube_nodeport=0
+  fi
   errs=''
   for r in clusterroles clusterrolebindings daemonsets namespaces; do
     kubectl auth can-i create "$r" -A >/dev/null 2>&1 || errs="$errs $r"
@@ -240,6 +307,7 @@ kube_check() {
     kube_ephemeral=1
     kube_limits="${kube_limits:+$kube_limits;}в кластере нет StorageClass по умолчанию: метрики, логи и трассы хранятся до перезапуска их пода (свой класс при новой установке: --set storage.className=…)"
   fi
+  [ -n "$kube_ephemeral" ] || kube_storage_check
   kubectl get apiservice v1beta1.metrics.k8s.io >/dev/null 2>&1 \
     || kube_limits="${kube_limits:+$kube_limits;}в кластере нет metrics-server: память и процессор приложений не видны"
   # The cluster's own networks: the pods' (from the servers) and the services' (around the API's address).
@@ -265,13 +333,47 @@ kube_check() {
   fi
 }
 
-# A value of the installed release, by its last key (empty when there is no release or it does not set it).
-kube_release_value() {
-  [ -n "${helm:-}" ] || return 0
-  "$helm" get values vtm --namespace "$ns" -a -o json 2>/dev/null | tr -d ' \n' | sed -n "s/.*\"$1\":\([a-z0-9]*\).*/\1/p" | head -n 1
+# The last --set of a key (Helm takes the rightmost one).
+set_value() { printf '%s' "$sets" | sed -n "s/^$(echo "$1" | sed 's/\./\\./g')=//p" | tail -n 1; }
+
+# The stores' disks will be made: the class chosen (storage.className, else the cluster's default) has a
+# working provisioner. A class of a cloud's old in-tree plugin (EKS's gp2: kubernetes.io/aws-ebs) makes
+# disks only through that cloud's CSI driver since Kubernetes 1.23; without the driver the claims stay
+# Pending forever — stop before installing, with the ways out.
+kube_storage_check() {
+  [ "$(set_value storage.ephemeral)" != true ] || return 0
+  cls=$(printf '%s' "$sets" | sed -n 's/^storage\.className=//p' | tail -n 1)
+  [ -n "$cls" ] || cls=$(kube_release_class)
+  # Several defaults (during a migration): Kubernetes takes the newest one.
+  [ -n "$cls" ] || cls=$(kubectl get storageclass --sort-by=.metadata.creationTimestamp -o jsonpath='{range .items[*]}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class} {.metadata.name}{"\n"}{end}' 2>/dev/null | sed -n 's/^true //p' | tail -n 1)
+  [ -n "$cls" ] || return 0
+  prov=$(kubectl get storageclass "$cls" -o jsonpath='{.provisioner}' 2>/dev/null) \
+    || die "StorageClass $cls нет в кластере (есть: $(kubectl get storageclass -o name 2>/dev/null | sed 's|.*/||' | tr '\n' ' '))"
+  case "$prov" in
+    kubernetes.io/aws-ebs | ebs.csi.aws.com) drv=ebs.csi.aws.com ;;
+    kubernetes.io/gce-pd | pd.csi.storage.gke.io) drv=pd.csi.storage.gke.io ;;
+    kubernetes.io/azure-disk | disk.csi.azure.com) drv=disk.csi.azure.com ;;
+    kubernetes.io/azure-file | file.csi.azure.com) drv=file.csi.azure.com ;;
+    kubernetes.io/cinder | cinder.csi.openstack.org) drv=cinder.csi.openstack.org ;;
+    kubernetes.io/vsphere-volume | csi.vsphere.vmware.com) drv=csi.vsphere.vmware.com ;;
+    *) return 0 ;;
+  esac
+  minor=$(kubectl version -o json 2>/dev/null | tr -d ' \n' | sed -n 's/.*"serverVersion":{[^}]*"minor":"\([0-9]*\).*/\1/p')
+  case "$prov" in kubernetes.io/*) [ "${minor:-99}" -ge 23 ] 2>/dev/null || return 0 ;; esac
+  kubectl get csidriver "$drv" >/dev/null 2>&1 && return 0
+  others=$(kubectl get storageclass -o jsonpath='{range .items[*]}{.metadata.name}={.provisioner}{"\n"}{end}' 2>/dev/null | grep -v "^$cls=" | sed 's/=.*//' | tr '\n' ' ')
+  warn "диски для метрик, логов и трасс не создадутся: StorageClass $cls ($prov) работает только через CSI-драйвер $drv, а его в кластере нет."
+  warn "Выход — один из трёх, потом запустите установщик снова:"
+  case "$drv" in
+    ebs.csi.aws.com) warn "  1) поставить драйвер EBS (EKS): aws eks create-addon --cluster-name <кластер> --addon-name aws-ebs-csi-driver --service-account-role-arn <роль с AmazonEBSCSIDriverPolicy> — пошагово: https://snemesh.github.io/vtm-install/agent.md#disks" ;;
+    *) warn "  1) поставить в кластер CSI-драйвер $drv (документация вашего облака)" ;;
+  esac
+  warn "  2) взять другой класс, который создаёт диски: --set storage.className=<класс>${others:+ (есть: $others)}"
+  die "  3) хранить без дисков: --set storage.ephemeral=true (метрики, логи и трассы пропадут при перезапуске их пода)"
 }
 
-# The installed release's storage class and sizes, as --set values (storage.sizes.loki=50Gi), one per line.
+# The installed release's storage class and sizes as it runs with them (defaults included), as --set
+# values (storage.sizes.loki=50Gi), one per line.
 kube_release_storage() {
   [ -n "${helm:-}" ] || return 0
   st=$("$helm" get values vtm --namespace "$ns" -a -o json 2>/dev/null | tr -d ' \n' \
@@ -281,6 +383,174 @@ kube_release_storage() {
   [ -z "$c" ] || echo "storage.className=$c"
   printf '%s' "$st" | sed -n 's/.*"sizes":{\([^}]*\)}.*/\1/p' | tr ',' '\n' \
     | sed -n 's/^"\([a-z0-9-]*\)":"\([0-9A-Za-z.]*\)"$/storage.sizes.\1=\2/p'
+}
+
+# The installed release's StorageClass (empty when there is none or it uses the default).
+kube_release_class() {
+  [ -n "${helm:-}" ] || return 0
+  # The storage's own className (map.ingress has one too); Helm writes the keys sorted, className first.
+  "$helm" get values vtm --namespace "$ns" -o json 2>/dev/null | tr -d ' \n' | sed -n 's/.*"storage":{"className":"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+# The stores' claims get disks: at most two minutes (then the cluster's own reason, and the ways out), so a
+# class that cannot make disks is told at once, not after the ten minutes of the rollout.
+kube_wait_disks() {
+  [ -z "$kube_ephemeral" ] || return 0
+  [ "$(set_value storage.ephemeral)" != true ] || return 0
+  i=0
+  while [ $i -lt 24 ]; do
+    pending=$(kubectl -n "$ns" get pvc -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase}{"\n"}{end}' 2>/dev/null | awk '$2 != "Bound" {print $1}')
+    [ -n "$pending" ] || return 0
+    sleep 5; i=$((i + 1))
+  done
+  first=$(echo "$pending" | head -n 1)
+  why=$(kubectl -n "$ns" get events --field-selector "involvedObject.name=$first" --sort-by=.lastTimestamp -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' 2>/dev/null | tail -n 1)
+  warn "за две минуты не создались диски: $(echo "$pending" | tr '\n' ' ')"
+  [ -z "$why" ] || warn "кластер говорит: $why"
+  warn "Удалите незаконченную установку (--uninstall) и поставьте снова с одним из вариантов:"
+  warn "  --set storage.className=<класс, который создаёт диски>   (классы: kubectl get storageclass)"
+  die "  --set storage.ephemeral=true   (без дисков: данные пропадут при перезапуске пода хранилища)"
+}
+
+# A value of the installed release, by its last key (empty when there is no release or it does not set it).
+kube_release_value() {
+  [ -n "${helm:-}" ] || return 0
+  "$helm" get values vtm --namespace "$ns" -a -o json 2>/dev/null | tr -d ' \n' | sed -n "s/.*\"$1\":\([a-z0-9]*\).*/\1/p" | head -n 1
+}
+
+
+# The parts of VTM in the cluster (resources.<part> in the chart).
+kube_parts='map telemetry-mcp telemetry-live victoria-metrics loki alloy tempo gate-http gate-otlp guard guard-init node-exporter blackbox-exporter beyla'
+# A size in Kubernetes' form: 3g, 3G, 3Gi → 3Gi; 512m, 512M, 512Mi → 512Mi (whole numbers).
+kube_size() {
+  case "$1" in
+    *[0-9][Gg]i | *[0-9][Gg]) n=${1%i}; n=${n%?}; u=Gi ;;
+    *[0-9][Mm]i | *[0-9][Mm]) n=${1%i}; n=${n%?}; u=Mi ;;
+    *) return 1 ;;
+  esac
+  case "$n" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$n" -gt 0 ] || return 1
+  echo "$n$u"
+}
+kube_limit_sets() {
+  for kv in $(echo "$limits" | tr ',' ' '); do
+    p=${kv%%=*} v=${kv#*=}
+    case " $kube_parts " in *" $p "*) ;; *) die "--limit: нет такой части VTM: $p (есть: $kube_parts)" ;; esac
+    sz=$(kube_size "$v") || die "--limit $kv: нужен размер вида 512Mi, 3Gi"
+    echo "resources.$p.limits.memory=$sz"
+    # The map's resources were map.resources before: an old override of it gives way to this one.
+    [ "$p" != map ] || echo "map.resources=null"
+  done
+}
+
+# How the map is reached, read from the cluster (the Ingress vtm-map, else the Service's type).
+kube_address() {
+  # wait: the address of a new load balancer is waited for (after installing); --status only reports.
+  tries=1; [ "${1:-}" = wait ] && tries=30
+  host=$(kubectl -n "$ns" get ingress vtm-map -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || true)
+  if [ -n "$host" ]; then
+    scheme=http
+    [ -z "$(kubectl -n "$ns" get ingress vtm-map -o jsonpath='{.spec.tls[0].hosts[0]}' 2>/dev/null)" ] || scheme=https
+    say "VTM работает:  $scheme://$host/   (пока имя не ведёт на ingress-контроллер кластера — kubectl -n $ns port-forward svc/vtm-map 8090:80)"
+    return
+  fi
+  case "$(kubectl -n "$ns" get svc vtm-map -o jsonpath='{.spec.type}' 2>/dev/null)" in
+    NodePort)
+      nodeport=$(kubectl -n "$ns" get svc vtm-map -o jsonpath='{.spec.ports[0].nodePort}')
+      addr=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' | sed '/^$/d' | head -n 1)
+      if [ -n "$addr" ]; then
+        say "VTM работает:  http://$addr:$nodeport/   (порт $nodeport на любом сервере кластера)"
+        say "Не открывается — облачный файрвол закрывает порты 30000–32767: откройте $nodeport или поставьте с --expose loadbalancer."
+      else
+        addr=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+        if is_private "$addr"; then
+          say "VTM работает:  http://$addr:$nodeport/ — это внутренний адрес сервера, он открывается только из сети кластера."
+          say "С этой машины:  kubectl -n $ns port-forward svc/vtm-map 8090:80 → http://127.0.0.1:8090/   (снаружи — --expose loadbalancer)"
+        else
+          say "VTM работает:  http://$addr:$nodeport/   (порт $nodeport на любом сервере кластера)"
+        fi
+      fi
+      say "Это HTTP: для HTTPS — --expose ingress=<имя> --https (или ingress=auto)."
+      ;;
+    LoadBalancer)
+      i=0 lb=''
+      while [ $i -lt "$tries" ] && [ -z "$lb" ]; do
+        lb=$(kubectl -n "$ns" get svc vtm-map -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}')
+        [ -n "$lb" ] || [ "$tries" = 1 ] || sleep 4
+        i=$((i + 1))
+      done
+      if [ -n "$lb" ]; then
+        say "VTM работает:  http://$lb/   (HTTP; для HTTPS — --expose ingress=<имя> --https)"
+      else
+        say "VTM работает, но у балансировщика пока нет адреса (в кластере его может не быть)."
+        say "Пока: kubectl -n $ns port-forward svc/vtm-map 8090:80 → http://127.0.0.1:8090/   Адрес позже: kubectl -n $ns get svc vtm-map"
+      fi
+      ;;
+    *)
+      say "VTM работает внутри кластера. Открыть: kubectl -n $ns port-forward svc/vtm-map 8090:80, затем http://127.0.0.1:8090/"
+      say "Открыть в сеть по HTTPS: --expose ingress=<домен> --https (или ingress=auto)."
+      ;;
+  esac
+}
+
+is_private() {
+  case "$1" in 10.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].* | 192.168.* | 127.* | 100.6[4-9].* | 100.[7-9][0-9].* | 100.1[01][0-9].* | 100.12[0-7].* | *:*) return 0 ;; esac
+  return 1
+}
+
+# The public address the cluster's ingress controller is reached at: a load balancer's (a Service on
+# port 443), else a server's external address, else a server's own address when it is public.
+kube_ingress_address() {
+  # The controller's own Service (Traefik, ingress-nginx, HAProxy, Contour/Envoy, Kong, Istio's gateway):
+  # another load balancer of the cluster on 443 is not where the ingress is.
+  # Each LoadBalancer: "name app-label ip hostname" (- for none).
+  lbs=$(kubectl get svc -A -o go-template='{{range .items}}{{if eq .spec.type "LoadBalancer"}}{{.metadata.name}} {{or (index .metadata.labels "app.kubernetes.io/name") "-"}} {{range .status.loadBalancer.ingress}}{{or .ip "-"}} {{or .hostname "-"}}{{end}}{{"\n"}}{{end}}{{end}}' 2>/dev/null \
+    | grep -Ei '^[^ ]*(traefik|ingress-nginx|ingress-controller|haproxy|envoy|contour|kong|istio-ingressgateway)|^[^ ]+ (traefik|ingress-nginx|rke2-ingress-nginx|haproxy-ingress|contour|envoy|kong|istio-ingressgateway) ' || true)
+  a=$(echo "$lbs" | awk '{print $3}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+  # A controller behind a load balancer with a DNS name only (AWS): the servers' addresses do not lead to
+  # its 443, so no <IP>.sslip.io; a name of the user's (a CNAME to it) does.
+  if [ -z "$a" ]; then
+    h=$(echo "$lbs" | awk '$4 != "-" && $4 != "" {print $4}' | head -n 1)
+    [ -z "$h" ] || die "ingress-контроллер стоит за балансировщиком с DNS-именем $h, а не с IP: ingress=auto здесь не подходит. Заведите имя (CNAME на $h) и укажите его: --expose ingress=<имя> --https"
+  fi
+  [ -n "$a" ] || a=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' 2>/dev/null | grep -E '^[0-9.]+$' | head -n 1)
+  if [ -z "$a" ]; then
+    for ip in $(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' 2>/dev/null); do
+      is_private "$ip" || { a=$ip; break; }
+    done
+  fi
+  echo "$a"
+}
+
+# Memory of every container of VTM now against its limit, restarts and why the last one ended (OOMKilled:
+# the limit is too low), and the map's address.
+kube_status() {
+  [ -n "$(kubectl -n "$ns" get daemonset -l app.kubernetes.io/part-of=vtm -o name 2>/dev/null)" ] || {
+    other=$(kube_other_vtm | head -n 1)
+    die "в namespace $ns нет VTM${other:+ (он в namespace $other: --namespace $other)}"
+  }
+  kubectl -n "$ns" get pods -o wide
+  say ""
+  kube_address
+  say ""
+  # Init containers too (Beyla's guard-init): one that is killed holds Beyla back.
+  lims=$(kubectl -n "$ns" get pods -o go-template='{{range .items}}{{$p := .metadata.name}}{{range .spec.initContainers}}{{$p}} {{.name}} {{with .resources.limits}}{{or .memory "-"}}{{else}}-{{end}}{{"\n"}}{{end}}{{range .spec.containers}}{{$p}} {{.name}} {{with .resources.limits}}{{or .memory "-"}}{{else}}-{{end}}{{"\n"}}{{end}}{{end}}')
+  sts=$(kubectl -n "$ns" get pods -o go-template='{{range .items}}{{$p := .metadata.name}}{{range .status.initContainerStatuses}}{{$p}} {{.name}} {{.restartCount}} {{with .lastState.terminated}}{{.reason}}{{else}}{{with .state.terminated}}{{if ne .reason "Completed"}}{{.reason}}{{else}}-{{end}}{{else}}-{{end}}{{end}}{{"\n"}}{{end}}{{range .status.containerStatuses}}{{$p}} {{.name}} {{.restartCount}} {{with .lastState.terminated}}{{.reason}}{{else}}-{{end}}{{"\n"}}{{end}}{{end}}')
+  top=$(kubectl -n "$ns" top pods --containers --no-headers 2>/dev/null || true)
+  [ -n "$top" ] || say "(нет metrics-server: память сейчас не видна, видны лимиты и перезапуски)"
+  say "Память VTM (сейчас / лимит):"
+  printf '%s\n--\n%s\n--\n%s\n' "$lims" "$sts" "$top" | awk '
+    function mi(q) { if (q ~ /Gi$/) return q * 1024; if (q ~ /Mi$/) return q + 0; if (q ~ /Ki$/) return q / 1024;
+      if (q ~ /G$/) return q * 953.7; if (q ~ /M$/) return q * 0.9537; return q / 1048576 }
+    /^--$/ { part++; next }
+    part == 0 && NF == 3 { lim[$1" "$2] = $3; order[++n] = $1" "$2 }
+    part == 1 && NF == 4 { rs[$1" "$2] = $3; why[$1" "$2] = $4 }
+    part == 2 && NF == 4 { use[$1" "$2] = $4 }
+    END { for (i = 1; i <= n; i++) { k = order[i]; split(k, a, " "); u = use[k]; l = lim[k]; note = ""
+        if (why[k] == "OOMKilled") note = " — убит за нехватку памяти: поднимите лимит (--limit " a[2] "=…)"
+        else if (u != "" && l != "-" && mi(u) >= 0.8 * mi(l)) note = sprintf(" — близко к лимиту (%d%%): поднимите примерно в 1,5 раза", 100 * mi(u) / mi(l))
+        if (rs[k] > 0) note = note " (перезапусков: " rs[k] ")"
+        printf "  %-18s %-34s %s / %s%s\n", a[2], a[1], (u == "" ? "—" : u), l, note } }'
 }
 
 # How the installed release opens the map, as an --expose value (empty: no release).
@@ -316,29 +586,77 @@ kube_install() {
     || die "не удалось разрешить привилегированные поды в namespace $ns (нужны права администратора)"
   # No helm --wait: it would wait for a load balancer's address that some clusters never give. The pods are
   # waited for below, the address after that.
-  set -- upgrade --install vtm "$VTM_CHART" --namespace "$ns" --timeout 10m
-  # The installed release's disks (class, sizes) stay as they are: a StatefulSet's disks cannot change.
+  # --reset-then-reuse-values: what earlier runs set stays (memory limits, the map's names, HTTPS), on the
+  # new chart's defaults; this run's values win.
+  set -- upgrade --install vtm "$VTM_CHART" --namespace "$ns" --timeout 10m --reset-then-reuse-values
+  # The disks as installed, defaults included (a later chart's other default size would change a
+  # StatefulSet's disks, which cannot change in place).
   for kv in $(kube_release_storage); do set -- "$@" --set "$kv"; done
   # latest: the newest chart, the main branch's builds included (they are pre-releases of the next
   # version, 1.2.4-main.N, newer than the release 1.2.3); a version: exactly that release.
-  if [ "$version" = latest ]; then set -- "$@" --devel; else set -- "$@" --version "$version" --set "image.tag=$version"; fi
+  if [ "$version" = latest ]; then set -- "$@" --devel --set image.tag=; else set -- "$@" --version "$version" --set "image.tag=$version"; fi
   if [ -n "$kube_ephemeral" ]; then set -- "$@" --set storage.ephemeral=true; else set -- "$@" --set storage.ephemeral=false; fi
   set -- "$@" --set "image.registry=$VTM_IMAGES"
   # The default networks and those of this cluster: an address in them is inside the cluster.
   set -- "$@" --set "beyla.cidrs={10.42.0.0/16,10.43.0.0/16,10.244.0.0/16,10.96.0.0/12${kube_cidrs:+,$kube_cidrs}}"
   # What the check found, as a JSON list (the lines have no quotes of their own).
-  [ -z "$kube_limits" ] || set -- "$@" --set-json "hostLimits=[\"$(printf '%s' "$kube_limits" | sed 's/;/","/g')\"]"
+  if [ -n "$kube_limits" ]; then
+    set -- "$@" --set-json "hostLimits=[\"$(printf '%s' "$kube_limits" | sed 's/;/","/g')\"]"
+  else
+    set -- "$@" --set-json 'hostLimits=[]'
+  fi
+  lsets=$(kube_limit_sets) || exit 1 # a wrong --limit stops here (die inside $(...) would not)
+  for kv in $lsets; do set -- "$@" --set "$kv"; done
   # How the map is reached: what was asked; else what the installed release has (a re-run changes
-  # nothing); else inside the cluster only (port-forward): the map is plain HTTP, and its password and
-  # the error lines of every app should not cross a network unasked.
+  # nothing); else inside the cluster only (port-forward): the map's password and the error lines of every
+  # app should not cross a network unasked.
   [ -n "$expose" ] || expose=$(kube_release_expose)
   [ -n "$expose" ] || expose=none
+  # HTTPS in the cluster is the ingress's: its controller ends TLS, cert-manager (when there is one) gets
+  # the certificate. ingress=auto: <the controller's address>.sslip.io, a name that leads to it.
+  if [ -n "$https" ] && [ "$https" != off ]; then
+    case "$expose" in
+      ingress=*) ;;
+      *) die "HTTPS в Kubernetes — через ingress кластера: --expose ingress=<имя> (или ingress=auto: <адрес>.sslip.io) вместе с --https" ;;
+    esac
+  fi
+  if [ "$expose" = ingress=auto ]; then
+    ip=$(kube_ingress_address)
+    [ -n "$ip" ] || die "не нашёл публичного адреса ingress-контроллера для ingress=auto: укажите имя — --expose ingress=<имя>"
+    expose="ingress=$(echo "$ip" | tr . -).sslip.io"
+  fi
+  case "$https" in
+    off) set -- "$@" --set map.ingress.tls=false --set map.ingress.clusterIssuer= ;;
+    internal) set -- "$@" --set map.ingress.tls=true --set map.ingress.clusterIssuer= ;;
+    auto | on)
+      set -- "$@" --set map.ingress.tls=true
+      issuer=$(printf '%s' "$sets" | sed -n 's/^map\.ingress\.clusterIssuer=//p' | tail -n 1)
+      if [ -z "$issuer" ]; then
+        # Only issuers cert-manager calls Ready (a stale one would never give the certificate).
+        issuers=$(kubectl get clusterissuers.cert-manager.io -o jsonpath='{range .items[*]}{.metadata.name} {.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null | sed -n 's/ True$//p' || true)
+        # The production one of Let's Encrypt when there are several (not its staging).
+        issuer=$(echo "$issuers" | grep -i prod | head -n 1)
+        [ -n "$issuer" ] || issuer=$(echo "$issuers" | grep -vi staging | head -n 1)
+      fi
+      if [ -n "$issuer" ]; then
+        set -- "$@" --set "map.ingress.clusterIssuer=$issuer"
+        say "HTTPS: сертификат выпустит cert-manager (ClusterIssuer $issuer)."
+      else
+        set -- "$@" --set map.ingress.clusterIssuer=
+        warn "в кластере нет готового ClusterIssuer cert-manager: HTTPS будет с сертификатом ingress-контроллера, браузер предупредит. Настоящий сертификат — cert-manager с готовым ClusterIssuer (или --set map.ingress.clusterIssuer=<имя>), затем установщик снова."
+      fi
+      ;;
+  esac
   case "$expose" in
-    nodeport) set -- "$@" --set map.service.type=NodePort ;;
-    loadbalancer) set -- "$@" --set map.service.type=LoadBalancer ;;
-    none) set -- "$@" --set map.service.type=ClusterIP ;;
+    nodeport)
+      set -- "$@" --set map.service.type=NodePort --set map.ingress.enabled=false
+      # 30890 belongs to another service: the cluster gives a free port (printed below).
+      [ -z "$kube_nodeport" ] || set -- "$@" --set map.service.nodePort=0
+      ;;
+    loadbalancer) set -- "$@" --set map.service.type=LoadBalancer --set map.ingress.enabled=false ;;
+    none) set -- "$@" --set map.service.type=ClusterIP --set map.ingress.enabled=false ;;
     ingress=*) set -- "$@" --set map.service.type=ClusterIP --set map.ingress.enabled=true --set "map.ingress.host=${expose#ingress=}" ;;
-    *) die "--expose: nodeport, loadbalancer, ingress=<host> или none" ;;
+    *) die "--expose: nodeport, loadbalancer, ingress=<host|auto> или none" ;;
   esac
   # The --set given to the installer, last: they win.
   old_ifs=$IFS
@@ -348,6 +666,7 @@ kube_install() {
   IFS=$old_ifs
   say "Ставлю VTM в namespace $ns (образы и стек, до 10 минут)…"
   "$helm" "$@" >/dev/null || die "helm не поставил VTM. Если прошлая установка оборвалась на полпути: $helm rollback vtm -n $ns — и снова"
+  kube_wait_disks
   for w in $(kubectl -n "$ns" get deploy,sts,ds -l app.kubernetes.io/part-of=vtm -o name); do
     if ! kubectl -n "$ns" rollout status "$w" --timeout=10m >/dev/null 2>&1; then
       kubectl -n "$ns" get pods -o wide >&2
@@ -356,49 +675,18 @@ kube_install() {
   done
   pass=$(kubectl -n "$ns" get secret vtm-auth -o jsonpath='{.data.MAP_PASSWORD}' | base64 -d)
   say ""
-  case "$expose" in
-    nodeport)
-      nodeport=$(kubectl -n "$ns" get svc vtm-map -o jsonpath='{.spec.ports[0].nodePort}')
-      addr=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' | sed '/^$/d' | head -n 1)
-      if [ -n "$addr" ]; then
-        say "VTM работает:  http://$addr:$nodeport/   (порт $nodeport на любом сервере кластера)"
-        say "Не открывается — облачный файрвол закрывает порты 30000–32767: откройте $nodeport или поставьте с --expose loadbalancer."
-      else
-        addr=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-        say "VTM работает:  http://$addr:$nodeport/ — это внутренний адрес сервера, он открывается только из сети кластера."
-        say "С этой машины:  kubectl -n $ns port-forward svc/vtm-map 8090:80 → http://127.0.0.1:8090/   (снаружи — --expose loadbalancer)"
-      fi
-      ;;
-    loadbalancer)
-      i=0 lb=''
-      while [ $i -lt 30 ] && [ -z "$lb" ]; do
-        lb=$(kubectl -n "$ns" get svc vtm-map -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}')
-        [ -n "$lb" ] || sleep 4
-        i=$((i + 1))
-      done
-      if [ -n "$lb" ]; then
-        say "VTM работает:  http://$lb/"
-      else
-        say "VTM работает, но балансировщик за 2 минуты не дал адреса (в кластере его может не быть)."
-        say "Пока: kubectl -n $ns port-forward svc/vtm-map 8090:80 → http://127.0.0.1:8090/   Адрес позже: kubectl -n $ns get svc vtm-map"
-      fi
-      ;;
-    ingress=*) say "VTM работает:  http://${expose#ingress=}/   (пока имя не ведёт на ingress-контроллер кластера — kubectl -n $ns port-forward svc/vtm-map 8090:80)" ;;
-    none)
-      say "VTM работает внутри кластера. Открыть: kubectl -n $ns port-forward svc/vtm-map 8090:80, затем http://127.0.0.1:8090/"
-      say "Открыть в сеть: запустите установщик с --expose ingress=<домен> (HTTPS — на ingress) или --expose loadbalancer."
-      ;;
-  esac
+  kube_address wait
   # The password only on a terminal: from a script (CI, an agent) it would stay in their logs.
   if [ -t 1 ]; then say "Пароль:        $pass"; else say "Пароль:        kubectl -n $ns get secret vtm-auth -o jsonpath='{.data.MAP_PASSWORD}' | base64 -d"; fi
-  say "Карта наполнится за две-три минуты. Обновить: запустите установщик ещё раз; удалить: --uninstall."
+  say "Карта наполнится за две-три минуты. Память и перезапуски: --status; лимит памяти: --limit beyla=3Gi."
+  say "Обновить: запустите установщик ещё раз (настройки сохраняются); удалить: --uninstall."
 }
 
 kube_uninstall() {
   a=$(ask "Удалить VTM из кластера $(kubectl config current-context) (namespace $ns и все его данные)? [y/N]") || a=${yes:+y}
   case "$a" in
     y | Y | д | Д | yes)
-      helm=$(helm_cmd)
+      helm=$(helm_cmd any)
       "$helm" uninstall vtm --namespace "$ns" --wait --timeout 5m >/dev/null || true
       kubectl -n "$ns" delete secret vtm-auth --ignore-not-found >/dev/null
       # The namespace goes only when VTM made it; a namespace of the user's keeps its other things.
@@ -422,5 +710,7 @@ case "$platform:$action" in
   docker:uninstall) docker_uninstall ;;
   kubernetes:install) kube_install ;;
   kubernetes:check) kube_check ;;
+  docker:status) docker_status ;;
+  kubernetes:status) kube_status ;;
   kubernetes:uninstall) kube_uninstall ;;
 esac

@@ -197,6 +197,10 @@
             <tr><td><code>--namespace vtm</code></td><td>Kubernetes: namespace</td></tr>
             <tr><td><code>--expose ingress=map.example.com</code></td><td>Kubernetes: как открыть карту — <code>none</code> (по умолчанию: <code>kubectl port-forward</code>), <code>ingress=&lt;домен&gt;</code>, <code>loadbalancer</code>, <code>nodeport</code></td></tr>
             <tr><td><code>--set storage.className=fast</code></td><td>Kubernetes: любое значение чарта (можно несколько раз)</td></tr>
+            <tr><td><code>--https</code></td><td>HTTPS для карты. Docker: сертификат Let's Encrypt для <code>--domain</code> или для имени <code>&lt;IP&gt;.sslip.io</code>; <code>--https internal</code> — свой сертификат на порту 8443; <code>--https off</code> — выключить. Kubernetes: вместе с <code>--expose ingress=&lt;имя&gt;</code> (или <code>ingress=auto</code>), сертификат от cert-manager</td></tr>
+            <tr><td><code>--domain map.example.com</code></td><td>Docker: домен карты для HTTPS</td></tr>
+            <tr><td><code>--limit beyla=3Gi</code></td><td>Лимит памяти части VTM (можно несколько раз); сохраняется при обновлениях</td></tr>
+            <tr><td><code>--status</code></td><td>Что работает: память каждой части против её лимита, перезапуски, адрес карты</td></tr>
             <tr><td><code>--check</code></td><td>Только проверить, что карта увидит здесь</td></tr>
             <tr><td><code>--uninstall</code></td><td>Удалить VTM и его данные</td></tr>
             <tr><td><code>--yes</code></td><td>Ничего не спрашивать, брать значения по умолчанию</td></tr>
@@ -215,8 +219,27 @@
           Затем откройте <code>http://127.0.0.1:8090/</code>.</div>
       </details>
       <details>
-        <summary>Карта открывается по HTTP. Это безопасно?</summary>
-        <div>Карта сама не делает HTTPS: по сети пароль шёл бы открытым текстом. Поэтому по умолчанию она в сеть не открыта (Docker — только <code>127.0.0.1</code>, Kubernetes — только внутри кластера), а для доступа извне ставьте перед ней свой прокси с HTTPS (в Kubernetes — <code>--expose ingress=&lt;домен&gt;</code> с TLS на ingress). Служебные порты на самом сервере (метрики Beyla 9400, в Docker ещё blackbox 9115) закрыты правилом файрвола VTM-GUARD: их видят только сервер, сеть стека, а в Kubernetes ещё сети кластера. VTM ставит это правило сам и убирает при удалении. В Kubernetes хранилища логов, метрик и трасс пускают только с токеном стека, даже там, где сеть кластера не применяет NetworkPolicy.</div>
+        <summary>Как открыть карту по HTTPS?</summary>
+        <div>Без HTTPS пароль идёт по сети открытым текстом. Вариантов четыре:
+          <ul>
+            <li><b>Сертификат Let's Encrypt</b> — <code>--https</code> (и <code>--domain map.example.com</code>, если есть домен). Перед картой встаёт Caddy и сам получает и продлевает сертификат. Нужен свободный порт 443, порт 80 не нужен. Без домена карта получает имя вида <code>203-0-113-5.sslip.io</code>, которое ведёт на IP сервера.</li>
+            <li><b>Свой сертификат</b> — <code>--https internal</code>, если порт 443 занят прокси проекта или у сервера нет публичного адреса. Карта открывается по <code>https://&lt;IP&gt;:8443/</code>, а браузер один раз предупредит о сертификате.</li>
+            <li><b>Прокси проекта</b> — поставьте VTM с <code>--bind 127.0.0.1</code> и направьте на <code>127.0.0.1:8090</code> свой nginx, Traefik или Caddy с HTTPS.</li>
+            <li><b>Kubernetes</b> — <code>--expose ingress=map.example.com --https</code> (или <code>ingress=auto</code>): TLS на ingress кластера, сертификат выпустит cert-manager, если он есть.</li>
+          </ul>
+          По умолчанию карта в сеть не открыта: Docker — только <code>127.0.0.1</code>, Kubernetes — только внутри кластера. Служебные порты на самом сервере (метрики Beyla 9400, в Docker ещё blackbox 9115) закрыты правилом файрвола VTM-GUARD, которое VTM ставит сам и убирает при удалении. В Kubernetes хранилища логов, метрик и трасс пускают только с токеном стека, даже там, где сеть кластера не применяет NetworkPolicy.</div>
+      </details>
+      <details>
+        <summary>Сколько памяти берёт VTM и как это поменять?</summary>
+        <div>У каждой части свой лимит памяти, так что VTM не заберёт память у проекта. Больше всего могут взять Beyla (до 2 ГБ), Tempo (до 3 ГБ) и Loki (до 2 ГБ); на небольшом проекте весь стек обычно занимает 300–600 МБ. <code>--status</code> показывает потребление каждой части против её лимита и перезапуски из-за нехватки памяти. Если часть упирается в лимит, поднимите его: <code>--limit tempo=4Gi</code> (на Docker-хосте сразу — <code>sudo /opt/vtm/vtm.sh limit tempo=4g</code>). Лимиты сохраняются при обновлениях. Процессор не ограничен, под нагрузкой VTM уступает его проекту.</div>
+      </details>
+      <details>
+        <summary>Можно ли поставить второй VTM на тот же сервер или в тот же кластер?</summary>
+        <div>Нет: установщик найдёт уже работающий VTM и не поставит второй. Иначе всё на карте было бы дважды, а вторая Beyla спорила бы с первой за порт 9400. Чтобы обновить тот, что уже стоит, запустите установщик с его папкой (<code>--dir</code>) или namespace (<code>--namespace</code>).</div>
+      </details>
+      <details>
+        <summary>Kubernetes: установка остановилась из-за дисков</summary>
+        <div>Метрики, логи и трассы лежат на дисках StorageClass кластера. Установщик заранее проверяет, что класс их создаёт. На EKS класс <code>gp2</code> (<code>kubernetes.io/aws-ebs</code>) с Kubernetes 1.23 работает только через CSI-драйвер EBS. Если драйвера нет, выходов три: поставить драйвер (дополнение <code>aws-ebs-csi-driver</code>, команды — в <a href="agent.md">инструкции</a>, раздел 9), выбрать другой класс (<code>--set storage.className=…</code>) или хранить без дисков (<code>--set storage.ephemeral=true</code>, тогда данные пропадут при перезапуске пода хранилища).</div>
       </details>
       <details>
         <summary>Забыл пароль карты</summary>
