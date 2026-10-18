@@ -38,7 +38,9 @@
   .copy { flex: none; border: 1px solid var(--line-strong); background: var(--raised); color: var(--ink); font: 500 14px Onest, sans-serif; padding: 8px 14px; border-radius: 10px; cursor: pointer; }
   .copy:hover { border-color: var(--accent); }
   .copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .copy[data-done] { color: var(--accent); }
+  .copy { transition: background-color .15s, color .15s, border-color .15s; min-width: 9.5em; }
+  .copy[data-state="done"] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  .copy[data-state="manual"] { border-color: var(--warn); color: var(--warn); }
   .hint { color: var(--faint); font-size: 14px; margin: 12px 0 0; }
 
   figure.shot { margin: 44px 0 0; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line-strong); background: #000; }
@@ -106,7 +108,7 @@
 
       <div class="cmd">
         <pre id="cmd"><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh</pre>
-        <button class="copy" type="button" data-copy="curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh">Скопировать</button>
+        <button class="copy" type="button" aria-live="polite" data-copy="curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh">Скопировать</button>
       </div>
       <p class="hint">Запускайте на сервере с Docker или на машине, где <code>kubectl</code> смотрит в ваш кластер. В конце установщик напечатает адрес карты и пароль.</p>
 
@@ -160,7 +162,7 @@
           <p style="color:var(--muted)">Проверить сервер, ничего не ставя:</p>
           <div class="cmd" style="max-width:none">
             <pre><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- --check</pre>
-            <button class="copy" type="button" data-copy="curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- --check">Скопировать</button>
+            <button class="copy" type="button" aria-live="polite" data-copy="curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- --check">Скопировать</button>
           </div>
         </div>
         <figure class="shot" style="margin:0">
@@ -175,7 +177,7 @@
       <p style="color:var(--muted);max-width:66ch;margin:0 0 18px">Откройте Claude Code (или другого агента) в своём проекте и дайте ему одну фразу. Он прочтёт инструкцию, сам поймёт, где работает проект — Docker или Kubernetes, проверит сервер, поставит VTM безопасно (без открытого порта), убедится, что карта видит ваши сервисы, и скажет, как её открыть.</p>
       <div class="cmd" style="max-width:none">
         <pre>Поставь VTM на этот проект по инструкции https://snemesh.github.io/vtm-install/agent.md</pre>
-        <button class="copy" type="button" data-copy="Поставь VTM на этот проект по инструкции https://snemesh.github.io/vtm-install/agent.md">Скопировать</button>
+        <button class="copy" type="button" aria-live="polite" data-copy="Поставь VTM на этот проект по инструкции https://snemesh.github.io/vtm-install/agent.md">Скопировать</button>
       </div>
       <p class="hint">Инструкция для агента: <a href="agent.md">agent.md</a> (то же в репозитории — <a href="https://github.com/snemesh/vtm-install/blob/main/AGENTS.md">AGENTS.md</a>). На рабочий сервер агент ставит только после вашего «да».</p>
     </section>
@@ -239,11 +241,38 @@
   </footer>
 </div>
 <script>
+  // Copy: the Clipboard API where the page may use it, else a hidden textarea and execCommand (older
+  // browsers, embedded browsers, http). Every press answers: «Скопировано», or the text is selected with
+  // a hint to press Ctrl+C / ⌘C when the browser allows neither.
+  function fallbackCopy(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.top = '-1000px';
+    document.body.appendChild(ta); ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+    ta.remove();
+    return ok;
+  }
+  function selectPre(btn) {
+    const pre = btn.parentElement.querySelector('pre');
+    if (!pre) return;
+    const r = document.createRange(); r.selectNodeContents(pre);
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+  }
   for (const b of document.querySelectorAll('.copy')) {
+    const label = b.textContent;
     b.addEventListener('click', async () => {
-      try { await navigator.clipboard.writeText(b.dataset.copy); } catch (_) { return; }
-      b.textContent = 'Скопировано'; b.dataset.done = '';
-      setTimeout(() => { b.textContent = 'Скопировать'; delete b.dataset.done; }, 1600);
+      const text = b.dataset.copy;
+      let ok = false;
+      try { await navigator.clipboard.writeText(text); ok = true; } catch (_) { ok = fallbackCopy(text); }
+      clearTimeout(b._t);
+      if (ok) {
+        b.textContent = '✓ Скопировано'; b.dataset.state = 'done';
+      } else {
+        selectPre(b);
+        b.textContent = 'Выделено — нажмите ' + (/Mac|iPhone|iPad/.test(navigator.platform) ? '⌘C' : 'Ctrl+C'); b.dataset.state = 'manual';
+      }
+      b._t = setTimeout(() => { b.textContent = label; delete b.dataset.state; }, 2200);
     });
   }
 </script>
