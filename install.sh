@@ -13,6 +13,7 @@
 #   --dir DIR                 Docker: where the stack lives (/opt/vtm, or ~/vtm without root)
 #   --namespace NS            Kubernetes: the namespace (vtm)
 #   --expose KIND             Kubernetes: nodeport (default), loadbalancer, ingress=<host>, none
+#   --set key=value           Kubernetes: a value of the chart (e.g. storage.className=fast), repeatable
 #   --check                   only check what the map would see here, install nothing
 #   --uninstall               remove VTM (and its data) from here
 #   --yes                     never ask: take the defaults
@@ -23,9 +24,27 @@ VTM_IMAGES=${VTM_IMAGES:-ghcr.io/snemesh}
 VTM_CHART=${VTM_CHART:-oci://ghcr.io/snemesh/charts/vtm}
 HELM_VERSION=${HELM_VERSION:-v3.18.4}
 version=${VTM_VERSION:-latest}
+version_given='' sets='' # sets: the --set values, one per line
 platform='' port='' bind='' dir='' ns=vtm expose=nodeport action=install yes=''
 
 say() { printf '%s\n' "$*"; }
+# The help is text of its own: with `curl … | sh` there is no file to read it from.
+usage() {
+  cat <<'HELP'
+VTM installer: the live 3D map of a Docker host or a Kubernetes cluster. https://snemesh.github.io/vtm-install/
+  curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- [options]
+  --docker | --kubernetes   which one, when both are here
+  --version X               a release (0.3.0); default the newest build
+  --port N --bind ADDR      Docker: the map's port (8090) and address (0.0.0.0; 127.0.0.1 = this host only)
+  --dir DIR                 Docker: where the stack lives (/opt/vtm, or ~/vtm without root)
+  --namespace NS            Kubernetes: the namespace (vtm)
+  --expose KIND             Kubernetes: nodeport (default), loadbalancer, ingress=<host>, none
+  --set key=value           Kubernetes: a value of the chart, e.g. storage.className=fast (repeatable)
+  --check                   only check what the map would see here
+  --uninstall               remove VTM and its data
+  --yes                     never ask
+HELP
+}
 warn() { printf 'VTM: %s\n' "$*" >&2; }
 die() { warn "$*"; exit 1; }
 has() { command -v "$1" >/dev/null 2>&1; }
@@ -34,16 +53,18 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --docker) platform=docker ;;
     --kubernetes | --k8s) platform=kubernetes ;;
-    --version) version=${2:?--version needs a value}; shift ;;
+    --version) version=${2:?--version needs a value}; version_given=1; shift ;;
     --port) port=${2:?--port needs a value}; shift ;;
     --bind) bind=${2:?--bind needs a value}; shift ;;
     --dir) dir=${2:?--dir needs a value}; shift ;;
     --namespace) ns=${2:?--namespace needs a value}; shift ;;
     --expose) expose=${2:?--expose needs a value}; shift ;;
+    --set) sets="$sets${2:?--set needs key=value}
+"; shift ;;
     --check) action=check ;;
     --uninstall) action=uninstall ;;
     --yes | -y) yes=1 ;;
-    -h | --help) sed -n '2,23p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h | --help) usage; exit 0 ;;
     *) die "не знаю параметра $1 (есть --help)" ;;
   esac
   shift
@@ -98,18 +119,40 @@ docker_dir() {
   if [ "$(id -u)" = 0 ]; then echo /opt/vtm; else echo "$HOME/vtm"; fi
 }
 
+docker_ready() {
+  has docker || die "Docker не установлен."
+  docker info >/dev/null 2>&1 || die "Docker не отвечает этому пользователю: запустите от root (… | sudo sh) или добавьте пользователя в группу docker."
+}
+
+# The image, with Docker's own words when it cannot be had (no access, no such version, no such platform).
+docker_pull() {
+  [ -z "${VTM_NO_PULL:-}" ] || return 0
+  if ! out=$(docker pull -q "$1" 2>&1); then
+    die "не удалось скачать $1: $(printf '%s' "$out" | tail -n 1)"
+  fi
+}
+
 docker_install() {
+  docker_ready
   d=$(docker_dir)
+  # A re-run without --version keeps the version the installation has (its .env), stack files included.
+  if [ -z "$version_given" ] && [ -f "$d/.env" ]; then
+    pinned=$(sed -n 's/^VTM_VERSION=//p' "$d/.env" | tail -n 1)
+    [ -z "$pinned" ] || version=$pinned
+  fi
   image="$VTM_IMAGES/vtm-collector:$version"
   say "VTM на Docker-хосте: $d, образы $VTM_IMAGES ($version)."
-  if [ -z "${VTM_NO_PULL:-}" ]; then
-    if ! docker pull -q "$image" >/dev/null 2>&1; then
-      die "не удалось скачать $image. Нет доступа к ghcr.io, нет такой версии, или пакет закрыт — тогда сначала docker login ghcr.io."
-    fi
+  # The folder is VTM's own: an existing folder with other things in it is not used (uninstall deletes the
+  # folder). .vtm marks a folder VTM made.
+  # (An installation made before the mark: its own vtm.sh and compose.yml of the project «vtm».)
+  if [ -d "$d" ] && [ ! -f "$d/.vtm" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ] \
+    && ! { [ -f "$d/vtm.sh" ] && grep -q '^name: vtm$' "$d/compose.yml" 2>/dev/null; }; then
+    die "в $d уже есть другие файлы: VTM ставится в свою, пустую папку (укажите другую: --dir)."
   fi
+  docker_pull "$image"
   # The stack's files come out of the image (/bundle/docker): .env (passwords, settings) and a map.config.json
   # of the installation's own stay as they are.
-  mkdir -p "$d"
+  mkdir -p "$d" && : > "$d/.vtm"
   tmp=$(mktemp -d)
   id=$(docker create "$image")
   docker cp "$id:/bundle/docker/." "$tmp/" >/dev/null
@@ -119,21 +162,24 @@ docker_install() {
   cp -R "$tmp/." "$d/"
   rm -rf "$tmp"
   chmod +x "$d/vtm.sh" "$d/beyla-config.sh"
-  # What is asked this time (version, port, address) changes an installation made before.
-  VTM_VERSION_SET=$version VTM_PORT_SET=$port VTM_BIND_SET=$bind VTM_IMAGES=$VTM_IMAGES VTM_VERSION=$version \
+  # What is asked this time (a version given with --version, port, address) changes an installation made
+  # before; a re-run without --version keeps the version it has.
+  VTM_VERSION_SET=${version_given:+$version} VTM_PORT_SET=$port VTM_BIND_SET=$bind VTM_IMAGES=$VTM_IMAGES \
     "$d/vtm.sh" up
 }
 
 docker_check() {
+  docker_ready
   d=$(mktemp -d)
   image="$VTM_IMAGES/vtm-collector:$version"
-  [ -n "${VTM_NO_PULL:-}" ] || docker pull -q "$image" >/dev/null 2>&1 || die "не удалось скачать $image"
+  docker_pull "$image"
   id=$(docker create "$image") && docker cp "$id:/bundle/docker/vtm.sh" "$d/" >/dev/null && docker rm "$id" >/dev/null
-  sh "$d/vtm.sh" check
+  VTM_PORT_SET=$port sh "$d/vtm.sh" check
   rm -rf "$d"
 }
 
 docker_uninstall() {
+  docker_ready
   d=$(docker_dir)
   [ -x "$d/vtm.sh" ] || die "в $d нет VTM (другая папка: --dir)"
   a=$(ask "Удалить VTM и все его данные (метрики, логи, трассы) из $d? [y/N]") || a=${yes:+y}
@@ -147,7 +193,7 @@ helm_cmd() {
   case "$(uname -m)" in x86_64 | amd64) arch=amd64 ;; aarch64 | arm64) arch=arm64 ;; *) die "нет helm, и для $(uname -m) его не скачать: поставьте helm сами" ;; esac
   # A folder of its own each time (mktemp -d: only this user can write there), and the archive checked
   # against the checksum Helm publishes next to it, before anything of it runs.
-  hdir=$(mktemp -d)
+  hdir=$(mktemp -d "${TMPDIR:-/tmp}/vtm-helm.XXXXXX") # removed at the end (cleanup below)
   tgz="helm-$HELM_VERSION-$os-$arch.tar.gz"
   say "Нет helm: скачиваю $HELM_VERSION во временную папку (только для установки)." >&2
   if ! curl -fsSL -o "$hdir/$tgz" "https://get.helm.sh/$tgz" || ! curl -fsSL -o "$hdir/$tgz.sha256sum" "https://get.helm.sh/$tgz.sha256sum"; then
@@ -176,14 +222,23 @@ kube_check() {
     major=$(echo "$kernel" | cut -d. -f1) minor=$(echo "$kernel" | cut -d. -f2 | tr -dc 0-9)
     # The pods are kept off other servers (node affinity): their apps are not on the map.
     case "$arch" in amd64 | arm64) ;; *) kube_limits="${kube_limits:+$kube_limits;}сервер $name ($arch): образов VTM для него нет, его приложения не видны" ;; esac
+    case "$kernel" in 10.0.*) continue ;; esac # a Windows server (VTM stays off it, counted below)
     if [ "$major" -lt 5 ] || { [ "$major" -eq 5 ] && [ "${minor:-0}" -lt 8 ]; }; then old="$old $name ($kernel)"; fi
   done
-  [ -z "$old" ] || kube_limits="ядро старше 5.8 на серверах:$old — трафик и запросы их приложений не видны"
-  # Disks for the stores: the cluster's default StorageClass; without one, emptyDir.
+  [ -z "$old" ] || kube_limits="${kube_limits:+$kube_limits;}ядро старше 5.8 на серверах:$old — трафик и запросы их приложений не видны"
+  win=$(kubectl get nodes -l kubernetes.io/os=windows -o name 2>/dev/null | wc -l | tr -d ' ')
+  [ "$win" = 0 ] || kube_limits="${kube_limits:+$kube_limits;}серверов Windows: $win — VTM на них не работает, их приложения не видны"
+  # Disks for the stores: the cluster's default StorageClass; without one, emptyDir. An installed release
+  # keeps the form it has: a StatefulSet's disks cannot change in place, and the upgrade would fail.
   kube_ephemeral=''
-  if ! kubectl get storageclass -o jsonpath='{range .items[*]}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' 2>/dev/null | grep -qx true; then
+  prev=$(kube_release_value ephemeral || true)
+  if [ -n "$prev" ]; then
+    [ "$prev" = true ] && kube_ephemeral=1
+  elif printf '%s' "$sets" | grep -q '^storage\.className='; then
+    :
+  elif ! kubectl get storageclass -o jsonpath='{range .items[*]}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' 2>/dev/null | grep -qx true; then
     kube_ephemeral=1
-    kube_limits="${kube_limits:+$kube_limits;}в кластере нет StorageClass по умолчанию: метрики, логи и трассы хранятся до перезапуска их пода (свой класс: --set storage.className=…)"
+    kube_limits="${kube_limits:+$kube_limits;}в кластере нет StorageClass по умолчанию: метрики, логи и трассы хранятся до перезапуска их пода (свой класс при новой установке: --set storage.className=…)"
   fi
   kubectl get apiservice v1beta1.metrics.k8s.io >/dev/null 2>&1 \
     || kube_limits="${kube_limits:+$kube_limits;}в кластере нет metrics-server: память и процессор приложений не видны"
@@ -191,8 +246,17 @@ kube_check() {
   for c in $(kubectl get nodes -o jsonpath='{range .items[*]}{.spec.podCIDR}{"\n"}{end}' 2>/dev/null | sort -u); do
     kube_cidrs="${kube_cidrs:+$kube_cidrs,}$c"
   done
+  # The services' range around the API's address: /16 inside the private ranges; else /20 (a /16 around
+  # GKE's 34.118.224.0/20 would call public addresses «inside»).
   svc=$(kubectl get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
-  case "$svc" in *.*.*.*) kube_cidrs="${kube_cidrs:+$kube_cidrs,}$(echo "$svc" | cut -d. -f1-2).0.0/16" ;; esac
+  case "$svc" in
+    10.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].* | 192.168.*) kube_cidrs="${kube_cidrs:+$kube_cidrs,}$(echo "$svc" | cut -d. -f1-2).0.0/16" ;;
+    *.*.*.*) a3=$(echo "$svc" | cut -d. -f3); kube_cidrs="${kube_cidrs:+$kube_cidrs,}$(echo "$svc" | cut -d. -f1-2).$((a3 / 16 * 16)).0/20" ;;
+  esac
+  # The servers' own addresses: pods with hostNetwork speak from them.
+  for ip in $(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' 2>/dev/null | sort -u); do
+    case "$ip" in *.*.*.*) kube_cidrs="${kube_cidrs:+$kube_cidrs,}$ip/32" ;; esac
+  done
   if [ -n "$kube_limits" ]; then
     say "Проверка кластера: карта будет видеть не всё —"
     printf '%s\n' "$kube_limits" | tr ';' '\n' | sed 's/^/  - /'
@@ -201,14 +265,45 @@ kube_check() {
   fi
 }
 
+# A value of the installed release, by its last key (empty when there is no release or it does not set it).
+kube_release_value() {
+  [ -n "${helm:-}" ] || return 0
+  "$helm" get values vtm --namespace "$ns" -a -o json 2>/dev/null | tr -d ' \n' | sed -n "s/.*\"$1\":\([a-z0-9]*\).*/\1/p" | head -n 1
+}
+
+# The installed release's storage class and sizes, as --set values (storage.sizes.loki=50Gi), one per line.
+kube_release_storage() {
+  [ -n "${helm:-}" ] || return 0
+  st=$("$helm" get values vtm --namespace "$ns" -a -o json 2>/dev/null | tr -d ' \n' \
+    | sed -n 's/.*"storage":{\("className"[^}]*}\).*/\1/p' | head -n 1)
+  [ -n "$st" ] || return 0
+  c=$(printf '%s' "$st" | sed -n 's/.*"className":"\([^"]*\)".*/\1/p')
+  [ -z "$c" ] || echo "storage.className=$c"
+  printf '%s' "$st" | sed -n 's/.*"sizes":{\([^}]*\)}.*/\1/p' | tr ',' '\n' \
+    | sed -n 's/^"\([a-z0-9-]*\)":"\([0-9A-Za-z.]*\)"$/storage.sizes.\1=\2/p'
+}
+
 kube_install() {
-  kube_check
   helm=$(helm_cmd)
-  set -- upgrade --install vtm "$VTM_CHART" --namespace "$ns" --create-namespace --wait --timeout 10m
+  kube_check
+  # The namespace, labelled so that the cluster's Pod Security lets Beyla, Alloy and node-exporter in (they
+  # read the servers: host network and processes, kernel tracing; «baseline» or «restricted» refuse them),
+  # and marked as VTM's, so that uninstall removes only a namespace VTM made.
+  if ! kubectl get namespace "$ns" >/dev/null 2>&1; then
+    kubectl create namespace "$ns" >/dev/null
+    kubectl label namespace "$ns" app.kubernetes.io/managed-by=vtm-install >/dev/null
+  fi
+  kubectl label namespace "$ns" --overwrite pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/warn=privileged >/dev/null \
+    || die "не удалось разрешить привилегированные поды в namespace $ns (нужны права администратора)"
+  # No helm --wait: it would wait for a load balancer's address that some clusters never give. The pods are
+  # waited for below, the address after that.
+  set -- upgrade --install vtm "$VTM_CHART" --namespace "$ns" --timeout 10m
+  # The installed release's disks (class, sizes) stay as they are: a StatefulSet's disks cannot change.
+  for kv in $(kube_release_storage); do set -- "$@" --set "$kv"; done
   # latest: the newest chart, the main branch's builds included (they are pre-releases of the next
   # version, 1.2.4-main.N, newer than the release 1.2.3); a version: exactly that release.
   if [ "$version" = latest ]; then set -- "$@" --devel; else set -- "$@" --version "$version" --set "image.tag=$version"; fi
-  [ -z "$kube_ephemeral" ] || set -- "$@" --set storage.ephemeral=true
+  if [ -n "$kube_ephemeral" ]; then set -- "$@" --set storage.ephemeral=true; else set -- "$@" --set storage.ephemeral=false; fi
   set -- "$@" --set "image.registry=$VTM_IMAGES"
   # The default networks and those of this cluster: an address in them is inside the cluster.
   set -- "$@" --set "beyla.cidrs={10.42.0.0/16,10.43.0.0/16,10.244.0.0/16,10.96.0.0/12${kube_cidrs:+,$kube_cidrs}}"
@@ -221,16 +316,34 @@ kube_install() {
     ingress=*) set -- "$@" --set map.service.type=ClusterIP --set map.ingress.enabled=true --set "map.ingress.host=${expose#ingress=}" ;;
     *) die "--expose: nodeport, loadbalancer, ingress=<host> или none" ;;
   esac
-  say "Ставлю VTM в namespace $ns (helm, до 10 минут: образы и стек)…"
-  "$helm" "$@" >/dev/null || die "helm не поставил VTM; что случилось: kubectl -n $ns get pods"
+  # The --set given to the installer, last: they win.
+  old_ifs=$IFS
+  IFS='
+'
+  for kv in $sets; do set -- "$@" --set "$kv"; done
+  IFS=$old_ifs
+  say "Ставлю VTM в namespace $ns (образы и стек, до 10 минут)…"
+  "$helm" "$@" >/dev/null || die "helm не поставил VTM. Если прошлая установка оборвалась на полпути: $helm rollback vtm -n $ns — и снова"
+  for w in $(kubectl -n "$ns" get deploy,sts,ds -l app.kubernetes.io/part-of=vtm -o name); do
+    if ! kubectl -n "$ns" rollout status "$w" --timeout=10m >/dev/null 2>&1; then
+      kubectl -n "$ns" get pods -o wide >&2
+      die "не поднялось: $w (поды — выше; подробнее: kubectl -n $ns describe $w)"
+    fi
+  done
   pass=$(kubectl -n "$ns" get secret vtm-auth -o jsonpath='{.data.MAP_PASSWORD}' | base64 -d)
   say ""
   case "$expose" in
     nodeport)
-      addr=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' | sed '/^$/d' | head -n 1)
-      [ -n "$addr" ] || addr=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
       nodeport=$(kubectl -n "$ns" get svc vtm-map -o jsonpath='{.spec.ports[0].nodePort}')
-      say "VTM работает:  http://$addr:$nodeport/   (порт $nodeport открыт на каждом сервере кластера)"
+      addr=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' | sed '/^$/d' | head -n 1)
+      if [ -n "$addr" ]; then
+        say "VTM работает:  http://$addr:$nodeport/   (порт $nodeport на любом сервере кластера)"
+        say "Не открывается — облачный файрвол закрывает порты 30000–32767: откройте $nodeport или поставьте с --expose loadbalancer."
+      else
+        addr=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+        say "VTM работает:  http://$addr:$nodeport/ — это внутренний адрес сервера, он открывается только из сети кластера."
+        say "С этой машины:  kubectl -n $ns port-forward svc/vtm-map 8090:80 → http://127.0.0.1:8090/   (снаружи — --expose loadbalancer)"
+      fi
       ;;
     loadbalancer)
       i=0 lb=''
@@ -239,9 +352,14 @@ kube_install() {
         [ -n "$lb" ] || sleep 4
         i=$((i + 1))
       done
-      if [ -n "$lb" ]; then say "VTM работает:  http://$lb/"; else say "VTM работает, балансировщик ещё не дал адреса: kubectl -n $ns get svc vtm-map"; fi
+      if [ -n "$lb" ]; then
+        say "VTM работает:  http://$lb/"
+      else
+        say "VTM работает, но балансировщик за 2 минуты не дал адреса (в кластере его может не быть)."
+        say "Пока: kubectl -n $ns port-forward svc/vtm-map 8090:80 → http://127.0.0.1:8090/   Адрес позже: kubectl -n $ns get svc vtm-map"
+      fi
       ;;
-    ingress=*) say "VTM работает:  http://${expose#ingress=}/" ;;
+    ingress=*) say "VTM работает:  http://${expose#ingress=}/   (пока имя не ведёт на ingress-контроллер кластера — kubectl -n $ns port-forward svc/vtm-map 8090:80)" ;;
     none) say "VTM работает внутри кластера: kubectl -n $ns port-forward svc/vtm-map 8090:80 → http://127.0.0.1:8090/" ;;
   esac
   say "Пароль:        $pass"
@@ -253,13 +371,21 @@ kube_uninstall() {
   case "$a" in
     y | Y | д | Д | yes)
       helm=$(helm_cmd)
-      "$helm" uninstall vtm --namespace "$ns" || true
-      kubectl delete namespace "$ns" --wait=false || true
-      say "VTM удалён из кластера."
+      "$helm" uninstall vtm --namespace "$ns" --wait --timeout 5m >/dev/null || true
+      kubectl -n "$ns" delete secret vtm-auth --ignore-not-found >/dev/null
+      # The namespace goes only when VTM made it; a namespace of the user's keeps its other things.
+      if [ "$(kubectl get namespace "$ns" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null)" = vtm-install ]; then
+        kubectl delete namespace "$ns" --timeout=5m >/dev/null || warn "namespace $ns ещё удаляется: kubectl get namespace $ns"
+      fi
+      say "VTM удалён из кластера (на серверах осталась только папка состояния /var/lib/vtm-alloy)."
       ;;
     *) say "Ничего не удалено." ;;
   esac
 }
+
+# The helm this run downloaded (helm_cmd runs in a subshell, so the folder is found by its name).
+cleanup() { [ -z "${helm:-}" ] || case "$helm" in */vtm-helm.*/*) rm -rf "${helm%/*/*}" ;; esac; }
+trap cleanup EXIT
 
 pick_platform
 case "$platform:$action" in

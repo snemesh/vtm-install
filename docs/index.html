@@ -158,7 +158,7 @@
       <div class="honest">
         <div>
           <h2>Карта не притворяется</h2>
-          <p style="color:var(--muted)">Чтобы видеть запросы и их ошибки, Beyla нужны возможности ядра: Linux 5.8+, BTF и kprobes. Установщик проверяет это до установки. Если чего-то нет — трафик между приложениями всё равно измеряется, но карта вместо <span class="pill ok">Всё работает</span> пишет <span class="pill wait">Неисправностей не видно</span> и объясняет, что именно ей не видно и почему.</p>
+          <p style="color:var(--muted)">Beyla нужны возможности ядра: Linux 5.8+ и BTF — чтобы видеть хоть что-то между приложениями, kprobes — чтобы видеть запросы и их ошибки. Установщик проверяет это до установки. На ядре без kprobes трафик между приложениями всё равно измеряется, но карта вместо <span class="pill ok">Всё работает</span> пишет <span class="pill wait">Неисправностей не видно</span> и объясняет, что именно ей не видно и почему.</p>
           <p style="color:var(--muted)">Проверить сервер, ничего не ставя:</p>
           <div class="cmd" style="max-width:none">
             <pre><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- --check</pre>
@@ -196,9 +196,11 @@
             <tr><td><code>--dir /srv/vtm</code></td><td>Docker: куда ставить (<code>/opt/vtm</code>, без root — <code>~/vtm</code>)</td></tr>
             <tr><td><code>--namespace vtm</code></td><td>Kubernetes: namespace</td></tr>
             <tr><td><code>--expose nodeport</code></td><td>Kubernetes: как открыть карту — <code>nodeport</code>, <code>loadbalancer</code>, <code>ingress=map.example.com</code>, <code>none</code></td></tr>
+            <tr><td><code>--set storage.className=fast</code></td><td>Kubernetes: любое значение чарта (можно несколько раз)</td></tr>
             <tr><td><code>--check</code></td><td>Только проверить, что карта увидит здесь</td></tr>
             <tr><td><code>--uninstall</code></td><td>Удалить VTM и его данные</td></tr>
             <tr><td><code>--yes</code></td><td>Ничего не спрашивать, брать значения по умолчанию</td></tr>
+            <tr><td><code>--help</code></td><td>Список параметров</td></tr>
           </tbody>
         </table>
       </div>
@@ -213,17 +215,21 @@
           Затем откройте <code>http://127.0.0.1:8090/</code>.</div>
       </details>
       <details>
+        <summary>Карта открывается по HTTP. Это безопасно?</summary>
+        <div>Карта сама не делает HTTPS. По сети пароль идёт открытым текстом, поэтому по умолчанию для рабочих серверов — <code>--bind 127.0.0.1</code> и SSH-туннель, а для доступа извне — ваш обратный прокси с HTTPS перед картой (в Kubernetes — <code>--expose ingress=&lt;домен&gt;</code> с TLS на ingress). Порт Beyla (9400) на Docker-хосте закрыт для внешних адресов правилом VTM-GUARD, которое ставит сам VTM и убирает при удалении.</div>
+      </details>
+      <details>
         <summary>Забыл пароль карты</summary>
         <div>Docker: <code>sudo /opt/vtm/vtm.sh password</code>. Kubernetes:
           <pre>kubectl -n vtm get secret vtm-auth -o jsonpath='{.data.MAP_PASSWORD}' | base64 -d</pre></div>
       </details>
       <details>
         <summary>Что VTM делает с моим проектом?</summary>
-        <div>Ничего не меняет. Читает Docker или Kubernetes API, логи контейнеров и трафик через eBPF. Хранит только счётчики, коды ответов и пути запросов — без тел, заголовков и текста SQL. Свой стек живёт отдельно (Compose-проект <code>vtm</code> или namespace <code>vtm</code>) и на карте не показывается.</div>
+        <div>Ничего в нём не меняет. Читает Docker или Kubernetes API, логи контейнеров и трафик через eBPF. Хранит у вас же, на этом сервере или в кластере: счётчики трафика и запросов, коды ответов, логи контейнеров (30 дней) и трассы запросов с путями — без тел и заголовков. Наружу ничего не отправляет. Свой стек живёт отдельно (Compose-проект <code>vtm</code> или namespace <code>vtm</code>) и на карте не показывается.</div>
       </details>
       <details>
         <summary>Связь нарисована не в ту сторону</summary>
-        <div>В первые минуты после установки так бывает: соединения, открытые до запуска Beyla, ещё не говорят, какая сторона — сервер. Через пять минут направление определяется по слушающему порту и больше не меняется.</div>
+        <div>В первые минуты после установки так бывает: соединения, открытые до запуска Beyla, ещё не говорят, какая сторона — сервер. Обычно за пять минут направление выясняется по слушающему порту. Если сторона не известна карте (адрес вне Docker и кластера), стрелка ставится по объёму трафика и может ошибаться.</div>
       </details>
       <details>
         <summary>Установка остановилась на «429 Too Many Requests»</summary>
@@ -231,7 +237,7 @@
       </details>
       <details>
         <summary>Как обновить или удалить</summary>
-        <div>Обновить — запустить ту же команду ещё раз. Удалить: <code>… | sh -s -- --uninstall</code> (для Kubernetes добавьте <code>--kubernetes</code>) или <code>sudo /opt/vtm/vtm.sh uninstall</code> на Docker-хосте.</div>
+        <div>Обновить — запустить ту же команду ещё раз. Удалить на Docker-хосте: <code>… | sudo sh -s -- --docker --uninstall</code> или <code>sudo /opt/vtm/vtm.sh uninstall</code>; в Kubernetes: <code>… | sh -s -- --kubernetes --uninstall</code>. Удаляется только стек VTM и его данные; namespace удаляется, только если его создал установщик.</div>
       </details>
     </section>
   </main>

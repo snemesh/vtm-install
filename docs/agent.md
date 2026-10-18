@@ -52,7 +52,8 @@ The installer prints in Russian. Read the output:
   fix (e.g. start Docker, add the user to the `docker` group, free port 8090 with `--port`), otherwise
   report it to the user and stop.
 - "карта будет видеть не всё" (the map will not see everything) → fine to install; tell the user what
-  will be missing (e.g. a kernel without kprobes: traffic is seen, requests and their errors are not).
+  will be missing (a kernel without kprobes: traffic is seen, requests and their errors are not; a
+  kernel older than 5.8 or without BTF: nothing between the apps is seen there, only the apps themselves).
 
 ## 3. Install
 
@@ -111,7 +112,8 @@ PY
 
 Compare the apps with the project's own services (Compose services or Deployments): each should be
 there; VTM's own stack is hidden. Traffic links appear as the apps talk (a minute or two); in the first
-~5 minutes one may point the wrong way, that settles by itself. The `cannot see` lines are what the map
+~5 minutes one may point the wrong way; it usually settles once the listening port is seen (a link to an
+address outside Docker/the cluster is directed by bytes and can stay wrong). The `cannot see` lines are what the map
 itself says it misses: pass them on to the user. `servers[].ping_ok` is false unless a ping address was
 configured; that is normal.
 
@@ -142,11 +144,12 @@ Optionally offer to give the map readable names: on a Docker host, `/opt/vtm/map
 | `429 Too Many Requests` from Docker Hub | the installer retries; if it still fails, `docker login` on the host and run again |
 | port 8090 busy | add `--port 8091` |
 | `rootless` Docker | eBPF does not work there; tell the user VTM needs regular Docker |
-| Kubernetes PVCs `Pending` | no default StorageClass: the installer normally detects this; rerun with `--set storage.ephemeral=true` via helm, or set `storage.className` |
+| Kubernetes PVCs `Pending` | no default StorageClass: the installer normally detects this; rerun the installer with `--set storage.className=<class>` (or `--set storage.ephemeral=true` for data that may be lost on restart) |
 | `kubectl auth can-i` failures | the user's kube context lacks cluster-admin; ask for one that has it |
 | map shows the stack but not the project | the project runs elsewhere (another host/cluster/context) — install there |
 | «есть и Docker, и Kubernetes: укажите --docker или --kubernetes» | pass the target you chose in step 1 |
 | `sudo: not found` | you are root already: run the same command without `sudo` |
+| Kubernetes pods stuck in rollout | the installer prints the pods that are not ready; `kubectl -n vtm describe pod <name>` tells why |
 
 ## 8. Remove
 
@@ -155,4 +158,10 @@ curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh
 curl -fsSL https://raw.githubusercontent.com/snemesh/vtm-install/main/install.sh | sh -s -- --kubernetes --uninstall --yes
 ```
 
-This deletes VTM's own stack and its data only.
+This deletes VTM's own stack and its data only. In Kubernetes the namespace is deleted only if the
+installer created it; a folder `/var/lib/vtm-alloy` (Alloy's state) stays on the nodes and can be removed by
+hand.
+
+The map is plain HTTP. Tell the user so if you exposed it beyond localhost/port-forward, and suggest HTTPS
+in front of it. VTM stores metrics, container logs (30 days) and request traces with paths on the target
+itself; nothing is sent elsewhere.
